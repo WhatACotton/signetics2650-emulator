@@ -1,0 +1,1263 @@
+	DFLT	1
+
+START	EQU	6800
+RAM	EQU	7000
+
+TTD	EQU	3 40mS Track-TracK De!ay
+DUAL	EQU	1  work drive
+RETRYC	EQU	3 no of retries
+FD1771	EQU	0C 1771 port
+FDCMD	EQU	FD1771 command/stat us
+FDTRK	EQU	FD1771+1 track register
+FDSEC	EQU	FD1771+2 sector register
+FDDAT	EQU	FD1771+3 data register
+FDINT	EQU	10 Control port
+
+BUSY	EQU	1 Status bits
+CRC	EQU	8 Cyclic redundancy check
+LSD	EQU	4 Lost data
+RNF	EQU	10 Record not found
+HDENG	EQU	20  Head engaged
+WPRT	EQU	40 Write protect
+NREADY	EQU	80 Drive not ready
+
+VERS	EQU	45 ???
+
+*	ERROR	CODES
+
+*	R	Read error
+*	U	Write error
+*	F	Full disc
+*	S	Seek error
+*	N	Not ready
+*	P	Protected disc
+*	0	Open error
+*	D	Device does not exist
+*	H	Hex error
+
+* MicroDOS		PAGE 2
+	ORG	START
+	BCTA,UN	DOS	Normal entry point
+	ACON	ENTER
+
+	ACON	OPNR Open seq file for read
+	ACON	GETCH Get next char,
+	ACON	CHAIN Chain to a file
+	ACON	OPNW Open for writing
+	ACON	PUTCH Put next char
+	ACON	CLSR Close read stream
+	ACON	CLSW Put char; close file
+	ACON	FIND Find file
+	ACON	FNEXT Find next file this spec
+	ACON	IO General 1/0 routine
+	ACON	DRIVE Select drive RO
+	ACON	ITEM Move buf ptr to next item
+	ACON	DOUT Print R2,R3 as decimal
+	ACON	LINE Accept a line of chcrs
+	ACON	CRLF Put ON 0A on any Stream
+	ACON	STDR Start of dir read
+	ACON	RDS1 Read sec at Tx R2, Sc R3
+	ACON	PNAM Print file name just found
+	ACON	RDSC Read a sector
+	ACON	WRSC Write a sector
+	ACON	HXOUT Hexout (BOUT from RK
+	ACON	GNMB Get NuMBer to XGOT0
+	ACON	PRID Print ID message,
+	ACON	DVRS DOS version
+	ACON	NFD Not found routine
+	ACON	DELENT Delete entry
+	ACON	ASGN Assign dev to a stream
+	ACON	RDNXSC Read next sector
+
+* Directory structure
+
+*	2	link to next sector
+
+* Identity block ( first sector only :)
+
+*	2	start of freeiist (track,sector)
+*	2	end of freelist (track,sector)
+*	2	length of freeliSt (sectors)
+*	1	no of tracks on disc
+*	1	no of sectors per track
+*	3	disk identity
+*	3	format date (DD/MM/YY)
+
+*	Directory entry - repeated 10 times Per sector
+
+*	10	file name (0 padding)
+*	3	extension (0 padding)
+*	2	start of file (track, sector)
+*	2	end of file (track, sector)
+*	2	length of file (sectors)
+*	I	file type
+*	1	spare
+*	3	write date (DD/MM/YY)
+* MicroDOS		PAGE 3
+* Cold entry point - initialises RAM
+
+DOS	LODI,R0	0D0	Force interrupt
+	WRTE,R0	FD1771	Clear scratch RAM
+	EORZ,R0
+	LODI,R3	CLEAR-RAM	Force drive 1
+	STRA,R0	RAM,R3-	Restore on drive 1
+	BRNR,R3	$-3
+	WRTE,R0	FDINT
+	LODI,R0	8+TTD
+	WRTE,R0	FD1771
+
+	BSTR,UN	VDU0	Setup VDU stream 0
+	LODI,R3	STR-STR
+	BSTA,UN	PRCR	"DOS"
+
+	BSTR,UN	SBFP	Setup Buf ptrs
+
+	LODI,R3	2
+DR	LODA,R0	STRTUP,R3-	Point to coldstart file
+	STRA,R0	BUFF,R3
+	BRNR,R3	DR
+
+	LODI,R1	10	Keyboard stream
+	BSTA,UN	FIND	Coldstart file
+	BCTR,N	ENTERK	not found
+	BSTA,UN	OPNR
+	BCTR,UN	ENTER	Execute startup
+
+* Initialise VDU stream 0
+VDU0	LODI,R3	7
+VB	LODA,R0	VDUB,R3-	Setup VDU stream 0
+	STRA,R0	IDNT,R3
+	BRNR,R3	VB
+	RETC,UN
+
+* Initialize stream buffer pointers
+SBFP	LODI,R0	<RAM+100
+	LODI,R3	0
+SBF	STRA,R0	HBUF,R3	Setup Buf Ptrs
+	ADDI,R0	1
+	ADDI,R3	10
+	COMI,R3	60
+	BCFR,EQ	SBF
+	RETC,UN
+
+ENTERK	LODI,R3	7
+KB	LODA,R0	KBDB,R3-	Setup KBD stream 10
+	STRA,R0	IDNT+10,R3
+	BRNR,R3	KB
+* MicroDOS		PAGE 4
+* Normal	entry point
+
+ENTER	LODI,R0	LCOM
+	LPSL	Set LCOM,	clear others
+	BSTR,UN	SBFP
+	LODI,R3	PMT-STR
+	BSTA,UN	PRCR	Prompt
+	STRA,R0	ERRH	Error handling flag
+	BSTA,UN	LINE	Get command line
+	LODA,R0	BUF	First char
+	COMI,R0	A'0'
+	BCTR,LT	ENTER	<0, ignore line
+	COMI,R0	A'9'	Numeric?
+	BSFA,GT	GNMB	Yes, Set address,
+	BCFR,EQ	FCMD	No valid; look for command file
+	BSTA,UN	*XGOTO	branch to it
+	BCTR,UN	ENTER	loop for subroutines
+
+FCMD	BSTR,UN	CHAIN	Into CHAIN, to execute it
+	BCTR,UN	ENTER	loop for subroutines
+* MicroDOS		PAGE 05
+* Find file, load & execute it
+* Note uses stream 20; Uses 4 subr levels
+
+CHAIN	LODI,R1	20	Use str 20 to search dir
+	LODA,R0	SYSD	Try SYS ory first
+FCMD1	BSTA,UN	ASDRV	assign drive, name
+
+	LODI,R3	3	Force .CMD
+CCMD2	LODA,R0	CMDS,R3-
+	STRA,R0	EXTN,R3	to extension
+	BRNR,R3	CCMD2
+	BSTA,UN	FIND1	find file in NAME
+	BCTR,P	CHAINI	Into CHAIN, to execute it
+
+	LODA,R0	DBPT,R1
+	BCTR,P	NFD0	explicit drive
+	LODA,R0	WRKD	default- test work
+	COMA,R0	DRV,R1	Work drv = current drv?
+	BCFR,EQ	FCMD1	No, try it
+
+NFD0	LODA,R0	ERRH	test error flag
+	BCTA,N	NFDERR	return to caller
+NFD	LODI,R3	NOTF-STR	"File not found"
+	BSTA,UN	PRCR
+	BCTA,UN	ENTERK
+
+* Execute entry from command module
+CHAINI	BSTA,UN	FIRST	Get first blk
+	EORZ,R0
+	STRA,R0	ADR+1
+
+CHAINL	BSTA,UN	GETCH	hi address
+	STRA,R0	ADR
+	BSTA,UN	GETCH	lo address
+	STRZ,R3
+	BSTA,UN	GETCH	Block length
+	STRZ,R2
+	BCTR,Z	CXIT
+	LODA,R1	PBPT+20	Use resisters for speed
+
+MOVE	BIRR,R1	MOV
+	LODI,R1	20
+	BSTA,UN	RDNXSC	get next sector
+	LODI,R1	2	Skip links only
+MOV	LODA,R0	*TMP,R1	Move from buffer
+	STRA,R0	*ADR,R3
+	BIRR,R3	IADR
+	EORZ,R0
+	ADDA,R0	ADR-1,R0+	Inc RAM ptr
+	STRA,R0	ADR
+IADR	BDRR,R2	MOVE	Repeat [blk len] times
+
+	STRA,R1	PBPT+20	Save for GETCHs
+	LODI,R1	20	Start new block
+	BCTR,UN	CHAINL
+
+CXIT	BXA	*ADR,R3	Yes, autostart
+* MicroDOS 		PAGE 06
+* Assign filespec (e.g. LPT: or n:NAME.EXT) to a stream
+* Spec at *BUFF; stream # in R1
+* Only R1 saved; 2 subr levels
+* Clear stream buffer; set IDNT, DRV, DBPT, (CODE non-disc)
+
+ASGN	EORZ,R0
+AS0	STRA,R0	IDNT-1,R1+
+	TMI,R1	0F
+	BCFR,EQ	AS0
+	ANDI,R1	70
+	LODI,R3	3
+	LODA,R0	*BUFF,R3	Check for dev
+	COMI,R0	A':'
+	BCFA,EQ	AS1	No
+
+* Parse device pointer
+	LODI,R3	4
+	LODI,R2	3
+	ADDI,R1	3
+DPRL	LODA,R0	*BUFF,R2-	Copy device name
+	STRA,R0	IDNT,R1-	to IDeNT of stream
+	BRNR,R2	DPRL
+	LODI,R2	3
+AS4	LODA,R0	*BUFF,R2-
+	COMA,R0	DSKD,R2	Was it DSK: ?
+	BCFR,EQ	COD	No, look it up
+	BRNR,R2	AS4
+	BCTA,UN	AS3	As before
+
+COD	LODI,R2	0	R2 steps thru device table
+COD2	LODI,R3	-1	R3 " " dev name
+CODL	LODA,R0	DEVS,R2	Lookup table
+	BCTR,N	ERRD	End of table if neg
+	COMA,R0	*BUFF,R3+
+	BCFR,EQ	NEQ	Not =, try next dev
+	TMI,R2	1
+	BCTR,EQ	CODI	Done if 2 chars match
+	BIRR,R2	CODL
+NEQ	ADDI,R2	4
+	ANDI,R2	7C	Put to 4byte bdry
+	BCTR,UN	COD2
+
+ERRD	LODI,R0	A'U'	U error - Unknown device
+	BCTA,UN	ERRM
+
+CODI	LODA,R0	DEVS,R2+	Get srvce routine addr
+	STRA,R0	CODE,R1	Store in stream info
+	LODA,R0	DEVS,R2+
+	STRA,R0	CODE+1,R1
+	LODI,R0	-1
+	STRA,R0	DRV,R1	Flag as non disk
+	RETC,UN	Flag as non disk
+
+AS1	LODI,R2	-1
+AS2	LODA,R0	DSKD,R2+	No! default to DSK:
+	STRA,R0	IDNT-1,R1+
+	BDRR,R3	AS2
+	ANDI,R1	70	Restore R1
+* MicroDOS	PAGE 07
+	LODA,R0	WRKD	Default use work drive
+* Assign drive R0 or explicitly specified drive
+ASDRV	LODI,R3	-1
+	STRA,R0	DRV,R1	set default drive
+	LODA,R0	*BUFF
+	SUBI,R0	A'1'	test drive no
+	BCTR,N	AS3	No
+	COMI,R0	3
+	BCTR,GT	AS3	No
+	LODI,R3	1	skip digit,dot
+	STRA,R0	DRV,R1
+AS3	LODZ,R3
+	STRA,R0	DBPT,R1	pointer to file spec.
+
+* Parse name into buffer
+ASNAME	LODI,R3	0D
+TTT	EORZ,R0
+	STRA,R0	NAME,R3-	clear name scratch
+	BRNR,R3	TTT
+	LODA,R0	DBPT,R1
+	STRZ,R3	R3 steps thru name at *BUFF
+* Subr to parse filespec
+PSN	LODI,R2	-1
+PSN1	BSTR,UN	GETSEP	get next char of spec
+	BCTR,EQ	PSED	Default extn
+	COMI,R0	A'.'	End of name?
+	BCTR,EQ	PSE	Parse extension
+	COMI,R2	9
+	BCTR,EQ	PSN1	already got 10
+	COMI,R0	A'*'
+	BCTR,EQ	PSN2
+	STRA,R0	NAME,R2+	store char in name buffer
+	BCTR,UN	PSN1
+PSN2	LODI,R0	A'?'	Replace * by ?
+PSN3	STRA,R0	NAME,R2+	store char in name buffer
+	COMI,R2	9
+	BCFR,EQ	PSN3
+	BCTR,UN	PSN1
+
+PSE	LODI,R2	-1
+PSE1	BSTR,UN	GETSEP	set next char of spec
+	BCTR,EQ	PSEND	seperator found
+	COMI,R2	2
+	BCTR,EQ	PSEND	already sot
+	COMI,R0	A'*'
+	BCTR,EQ	PSE2
+	STRA,R0	EXTN,R2+	store char in extension buffer
+	BCTR,UN	PSE1
+* Default extension
+PSED	LODI,R2	-1
+PSE2	LODI,R0	A'?'	Replace * by ?
+PSE3	STRA,R0	EXTN,R2+	store char in extension buffer
+	COMI,R2	2
+	BCFR,EQ	PSE3
+PSEND	RETC,UN
+* Get char ; test if seperator
+GETSEP	LODA,R0	*BUFF,R3+
+	COMI,R0	A'a'
+* MicroDOS	PAGE 08
+	BCTR,LT	$+4	Conv to upper case
+	ANDI,R0	5F
+	COMI,R0	CR
+	RETC,EQ
+	COMI,R0	A','
+	RETC,EQ
+	COMI,R0	A'='
+	RETC,EQ
+	COMI,R0	SPAC
+	RETC,UN
+* MicroDOS	PAGE 09
+* Open a file for read
+* Name is at *BUFF; use stream in R1
+* Saves RI-R3 subr levels
+
+OPNR	BSTA,UN	FIND	Look it up
+	BCTR,P	S1	found
+	BCTR,Z	RT	Return if non-disk
+	BIRR,R0	RT	error return
+NFDERR	LODI,R0	A'N'	N error - File does Not exist
+	BSTR,UN	RT	restore resisters
+	BCTA,UN	ERRM
+
+*Open after successful FIND
+OPNRF	STRA,R2	SR2	Save R2,R3
+	STRA,R3	SR3
+
+S1	LODI,R0	<GETCH
+	STRA,R0	CODE,R1	Srvce, rtne is GETCH
+	LODI,R0	>GETCH
+	STRA,R0	CODE+1,R1
+
+	BSTA,UN	FIRST	Get first sector to buffer
+
+RT	LODA,R2	SR2	Restore regs:
+	LODA,R3	SR3
+	IORZ,R0	set CC
+	RETC,UN
+
+* Open a file for write
+* Can't open more than 1 file for write
+* Name at *BUFF; str # in R1
+* Saves R1-R3; 4 subr levels
+
+OPNW	BSTA,UN	FIND	Check if already exists
+	BCTR,P	OPREM	exists
+	COMI,R0	-1
+	BCTR,EQ	OP1	doesn' t exist
+	BCTR,UN	RT	non-disk or error
+
+* File already exists - remove
+OPREM	LODI,R3	4	remove flag
+	BSTA,UN	REMENT
+	BCTR,N	RT
+
+OP1	LODI,R0	<PUTCH	Service routine iS PUTCH
+	STRA,R0	CODE,R1
+	LODI,R0	>PUTCH
+	STRA,R0	CODE+1,R1
+	BSTA,UN	STDR	St of d i r
+	BCTR,N	WRT2	disc error
+	LODI,R3	2
+	LODA,R0	*TMP,R3	freeIist - track
+	STRA,R0	ADR	Save start of freeIist
+	BCFR,N	OP2	valid track
+	BIRA,R0	WPE	unclosed write on disc
+	BCTA,UN	FERR	disc full
+
+* MicroDOS	PAGE 10
+OP2	IORI,R0	80	flag write
+	STRA,R0	*TMP,R3
+	LODA,R0	*TMP,R3+	freelist - sector
+	STRA,R0	ADR+1
+	BSTA,UN	WRSC	Rewrite identity block
+	BCTR,N	WRT2	disc error
+
+*Search for free directory entry
+	LODI,R3	10-18	"Zeroth" entry
+OP3	BSTA,UN	DIRF	Move forward 1 dir entry
+WRT2	BCTA,N	WRT1	disc error
+	LODA,R0	*TMP,R3
+	BCTR,P	OP3
+
+*Construct new directory entry in DENT
+	EORZ,R0
+	LODI,R2	18
+ZDEN	STRA,R0	DENT,R2-
+	BRNR,R2	ZDEN
+
+	LODI,R2	0D
+TFNAM	LODA,R0	NAME,R2-
+	STRA,R0	DENT,R2	Put in name and ext
+	BRNR,R2	TFNAM
+
+	LODI,R3	2
+OP5	LODA,R0	ADR,R3-	Transfer start of file
+	STRA,R0	DENT+0D,R3
+	BRNR,R3	OP5
+	LODA,R0	DATV	Date valid?
+	BIRR,R0	NDAT	No
+	LODI,R3	3
+WDAT	LODA,R0	DATE,R3-	Transfer date
+	STRA,R0	DENT+15,R3
+	BRNR,R3	WDAT
+
+* Transfer DENT to directory buffer
+NDAT	LODI,R2	18
+	LODA,R0	DBYT,R1
+	ADDZ,R2
+	STRZ,R3
+WDIR	LODA,R0	DENT,R2-
+	STRA,R0	*TMP,R3-
+	BRNR,R2	WDIR
+
+	BSTA,UN	WRSC	Move buffer to floppy
+WRT1	BCTR,N	WRT	disc error
+	LODI,R0	1
+	STRA,R0	LLEN,R1	Length=l
+	BSTA,UN	FIRST	Read first sector
+WRT	BCTA,UN	RT	Restore R2113, return
+* MicroDOS	PAGE 11
+* Put one byte to a file opened for write
+* Byte is in R0: R1 has str #
+* Saves R0-R3; 3 subr levels if disk
+
+PUTCH	STRA,R3	SR3	Save R3
+	STRA,R0	SR0	Save R0
+	LODA,R0	PBPT,R1	Get buf ptr
+	BIRR,R0	PEND
+	LODA,R0	LLEN,R1	Increment length
+	BIRR,R0	PUT0
+	LODA,R0	HLEN,R1
+	ADDI,R0	1
+	STRA,R0	HLEN,R1
+	EORZ,R0
+PUT0	STRA,R0	LLEN,R1
+	BSTA,UN	WRSC	Write current buffer
+	BSTA,EQ	RDNXSC	Read next to, set Iinks
+	RETC,N	Read next to, set Iinks
+	LODI,R0	2
+PEND	STRA,R0	PBPT,R1
+	STRZ,R3
+	BSTR,UN	STMP
+	LODA,R0	SR0	Get char
+	STRA,R0	*TMP,R3	Store it
+	LODA,R3	SR3
+	COMZ,R0	CC =
+	RETC,UN
+
+STMP	LODA,R0	HBUF,R1	Get approp bUF ptr
+	STRA,R0	TMP	Save
+	RETC,UN
+
+* Get one bYte from file opened for read or write
+* Returns byte in R0; Strm # must be in R1
+* Saves RI-R3; 3 subr levels if disk
+
+GETCH	BSTR,UN	STMP	Setup tyuff ptr
+	LODA,R0	PBPT,R1	Prog Buf PTr
+	BIRR,R0	HERE
+	BSTA,UN	RDNXSC	Get next sector
+	RETC,N	Get next sector
+	LODI,R0	2	Skip links
+HERE	STRA,R0	PBPT,R1
+	LODA,R0	*TMP,R0	Get char
+	COMZ,R0	Get char
+	RETC,UN
+* MicroDOS	PAGE 12
+* Close a file that was opened for write
+* Only R1 saved; 3 subr levels if disk
+
+CLSW	LODA,R0	HLEN,R1	length written
+	IORA,R0	LLEN,R1
+	BCTA,Z	CLSR	File not t open for r write
+	BSTR,UN	STMP	Setup buff ptr
+
+	ADDI,R1	2
+	LODI,R2	2
+CLS1	LODA,R0	TRK,R1-
+	STRA,R0	DENP,R2-	Trk,sec of last block
+	LODA,R0	*TMP,R2
+	STRA,R0	DENP+2,R2	Trk,sec of following block
+	BRNR,R2	CLS1
+
+	LODI,R0	-1
+	STRA,R0	*TMP	Put end of file to last sector
+	BSTA,UN	WRSC	Write last block
+	RETC,N	Write last block
+	LODA,R0	DRV,R1
+	BCTA,N	CLSR	Exit if nondisk
+
+* Update disc identity block
+	BSTA,UN	STDR
+	RETC,N	disc error
+	LODI,R3	4
+	LODI,R2	8
+	ADDI,R1	2
+	PPSL	WC+CAR
+CLS2	LODA,R0	DENP,R3-	TrK, sec of following
+	STRA,R0	*TMP,R3	Update start of freelist
+	LODA,R0	*TMP,R2-	Old length
+	SUBA,R0	HLEN,R1-	length written,
+	STRA,R0	*TMP,R2	new length
+	TMI,R1	1
+	BCTR,EQ	CLS2
+	CPSL	WC
+	BSTA,UN	WRSC	Put to disk
+	RETC,N	Put to disk
+
+* Update directory entry
+	LODA,R0	DSEC,R1	directory sector
+	BSTA,UN	SSEC	Get incomplete file dir
+	RETC,N	Get incomplete file dir
+	LODA,R0	DBYT,R1	directory byte
+	ADDI,R0	0A+3+7	Skip name, ext, start
+	STRZ,R3
+	LODI,R2	3
+	ADDI,R1	3
+CLS3	LODA,R0	HLEN,R1-	Move length, type
+	STRA,R0	*TMP,R3-
+	BDRR,R2	CLS3
+	LODI,R2	2
+CLS4	LODA,R0	DENP,R2-	Move last trk,sec.
+	STRA,R0	*TMP,R3-
+	BRNR,R2	CLS4
+	BSTA,UN	WRSC	Write completed dir
+* MicroDOS	PAGE 13
+	RETC,N	Write completed dir
+
+* Close file opened for read
+
+CLSR	EORZ,R0
+	STRA,R0	IDNT,R1	Close stream
+	RETC,UN
+
+* Delete directory entry just found
+* Only R1 saved; 3 subr levels
+* CAUTION - doesn't check for open file yet!!
+
+DELENT	LODI,R3	6	delete flag
+REMENT	LODA,R0	DBYT,R1	Directory byte
+	STRZ,R2
+	EORZ,R0
+	STRA,R0	*TMP,R2	zero first char of name
+	BSTA,UN	WRSC	rewrite directory sector
+	RETC,N	rewrite directory sector
+	BSTA,UN	STDR	Get identity block
+	RETC,N	Get identity block
+
+	LODI,R2	6
+	LODA,R0	*TMP,R2
+	IORA,R0	*TMP,R2+	Test 0 length
+	BCFR,Z	LEN0
+* Freelist length 0; file becomes freelist
+	LODI,R3	6
+	BSTR,UN	SWAP	Interchange end
+LEN0	BSTR,UN	SWAP	Interchange start or end
+
+* Add length of deleted file to freelist length
+	LODI,R2	8
+ADL	LODA,R0	*TMP,R2-	freelist length
+	ADDA,R0	DENT+0B,R2	file length
+	STRA,R0	*TMP,R2
+	PPSL	WC
+	TMI,R2	1
+	BCTR,EQ	ADL
+	CPSL	WC
+	BSTR,UN	WRSC	rewrite identity block
+	RETC,N	rewrite identity block
+
+* Relink end sector to start sector
+	LODA,R2	DENT+0A+05
+	LODA,R3	DENT+0A+06
+	BSTA,UN	RDS1	Get end sector
+	RETC,N	Get end sector
+	LODI,R3	2
+RLNK	LODA,R0	DENT+0A+03,R3-	Start (link)
+	STRA,R0	*TMP,R3
+	BRNR,R3	RLNK
+	BCFR,N	WRSC	rewrite last sector
+	COMZ,R0
+	RETC,UN
+* MicroDOS	PAGE 14
+* Swap start or end sectors in freelist and DENT
+SWAP	LODA,R0	*TMP,R3-
+	STRZ,R2
+	LODA,R0	DENT+0B,R3
+	STRA,R0	*TMP,R3
+	LODZ,R2
+	STRA,R0	DENT+0B,R3
+	TMI,R3	1
+	BCTR,EQ	SWAP
+	RETC,UN
+* MicroDOS	PAGE 15
+* Write a sector from buffer to disk
+* Saves R1-R3; 2 subr levels if disk, or M+1 subr levels
+* if non-disk.
+
+WRSC	BSTA,UN	INIT
+	BCTA,N	WRND	Non disk
+
+	BSTA,UN	SK
+	BCTR,N	WRTN	disc error
+	LODI,R2	RETRYC
+NWPA	STRA,R2	RTYCNT
+	LODI,R0	0AC	- Write sector command
+	WRTE,R0	FDCMD
+	REDE,R0	FDINT
+	BCFR,N	$-2	wait for DRQ or INTERUPT
+	REDE,R0	FDCMD
+	TMI,R0	WPRT	Check wrt Prot bit
+	BCTR,EQ	WPE
+	ANDI,R0	NREADY+RNF+CRC
+	BCFR,Z	WERR	write error
+L5	LODA,R0	*TMP,R3	Get from buffer
+	REDE,R2	FDINT
+	BCFR,N	$-2	wait for DRQ
+	WRTE,R0	FDDAT	Into data reg
+	BIRR,R3	L5
+WWAIT	REDE,R0	FDCMD
+	TMI,R0	BUSY
+	BCFR,EQ	WWAIT
+	ANDI,R0	RNF+LSD
+	BCFR,Z	WERR	write error
+* Check CRC of sector just written
+	LODI,R0	8C	Read sector command
+	WRTE,R0	FDCMD
+	BSTA,UN	WBSDD	Wait for 1771 to interrupt out
+	ANDI,R0	CRC+RNF
+	BCFR,Z	WERR	write error
+WRTN	CPSL	RS
+	RETC,UN
+
+WERR	TMI,R0	RNF	Record not found?
+	BSTA,EQ	RESEEK
+	BCTR,N	WRTN	disc error
+	LODA,R2	RTYCNT
+	BDRA,R2	NWPA	try again
+	LODI,R2	A'W'	Write error
+WRR	BCTA,UN	ERR
+
+WPE	LODI,R2	A'P'	Write protected
+	BCTR,UN	WRR
+* MicroDOS	PAGE 16
+* Move to start of directory
+* Saves R1-R3; 2 subr levels
+STDR	EORZ,R0
+	STRA,R0	TRK,R1	Track 0
+	BIRR,R0	SSEC	sector 1
+
+* Get first sector of found  file to buffer
+FIRST	LODA,R2	DENT+0D	Start track
+	LODA,R3	DENT+0D+1	St sec
+
+* Move to Track R2, Sector R3
+RDS1	LODZ,R2
+	STRA,R0	TRK,R1
+	LODZ,R3
+	BCTR,UN	SSEC	Get this sector
+
+* Read next sector
+* Saves R1-R3; 2 subr levels
+RDNXSC	BSTA,UN	STMP	Setup buff ptr
+	LODA,R0	*TMP	Trk,Sec of next block
+	STRA,R0	TRK,R1
+	EORZ,R0
+	LODA,R0	*TMP,R0+
+SSEC	STRA,R0	SEC,R1
+
+	LODI,R0	1
+	STRA,R0	PBPT,R1	Skip links
+
+* Read one e sector from disk to buffer
+* Saves R1-R3; 2 subr levels if disk, or M+1 subr
+* levels if non-disk, where M is levels of service rtne
+
+RDSC	BSTA,UN	INIT
+	BCTA,N	RDND	If non dsk
+	BSTA,UN	SK	Seek correct track
+	BCTR,N	RRTN	disk error
+	LODI,R2	RETRYC
+RDL	LODI,R0	8C	Read sector command
+	WRTE,R0	FDCMD
+L4	REDE,R0	FDINT	DRQ?
+	BCFR,N	L4
+	REDE,R0	FDDAT	Move from data reg
+	STRA,R0	*TMP,R3	into approp buffer
+	BIRR,R3	L4
+	BSTR,UN	WBSY
+	ANDI,R0	RNF+CRC+LSD
+	BCTR,Z	RRTN
+	TMI,R0	RNF	Record not found?
+	BSTA,EQ	RESEEK
+	BCTR,N	RRTN	disc error
+	BDRR,R2	RDL	Retry
+	LODI,R2	A'R'
+	BCTA,UN	ERR	Read error
+
+RRTN	CPSL	RS
+	RETC,UN
+* MicroDOS		PAGE 17
+WBSDD	LODR,R0	*$	Super delay entry
+	NOP	Super delay entry
+	BCTR,UN	WBSD
+
+* Wait for drive not
+
+WBSY	REDE,R0	FDCMD
+	TMI,R0	BUSY
+	RETC,NE
+WBSD	BCTR,UN	WBSY	Delay entry
+
+INIT	LODZ,R1
+	PPSL	RS
+	STRZ,R1	Save stream index
+	LODA,R0	HBUF,R1
+	STRA,R0	TMP
+	LODA,R0	DRV,R1
+	RETC,N
+
+* Select drive given in R0 on str R1
+* Saves R1; 1 subr level
+
+DRIVE	LODA,R3	CDRV	Current drive
+	WRTE,R0	FDINT	Select side, drive
+	ANDI,R0	3	Isolate drive
+	STRA,R0	DRV,R1
+	STRA,R0	CDRV	Save drive
+	COMZ,R3	Save drive
+	RETC,EQ	Save drive
+	STRZ,R2
+	REDE,R0	FDTRK	Current track
+	STRA,R0	TRK1,R3	Save it
+	LODA,R0	TRK1,R2
+	WRTE,R0	FDTRK	tO FD1771
+	RETC,UN
+* MicroDOS		PAGE 18
+* Seek to requested track
+SK	LODI,R3	D'20'
+	REDE,R0	FDCMD
+	ANDI,R0	HDENG
+	BCTR,Z	SKHLD	head not loaded
+	REDE,R0	FDTRK
+	COMA,R0	TRK,R1	Already on read trek?
+	BCTR,EQ	SRDY	Yes, no seek
+SKHLD	LODA,R0	TRK,R1
+	BCFR,N	SKOK
+FERR	LODI,R2	A'F'	F error- disk
+	BCTR,UN	CERR	or dir full
+SKOK	WRTE,R0	FDDAT	Track
+	LODI,R0	18+TTD	Seek with HLD
+	WRTE,R0	FDCMD
+W1	REDE,R0	FDINT
+	BCFR,N	W1
+*Wait for drive ready
+*Loop for 100 mSec
+SRDY	LODI,R2	D'85'
+*Inner loop 1mSec
+SRDY1	REDE,R0	FDCMD	wait for drive ready
+	BCFR,N	SKD
+	BDRR,R0	$
+	BDRR,R2	SRDY1
+	BDRR,R3	SKHLD	seek to Keep head loaded
+*Drive not ready after 2 Sec
+	LODI,R2	A'D'	Drive Not ready error
+CERR	BCTR,UN	IERR
+
+SKD	LODA,R0	SEC,R1
+	WRTE,R0	FDSEC	Write sector reg
+	LODI,R3	0
+	RETC,UN
+
+RESEEK	LODI,R3	RETRYC
+	LODI,R0	08+TTD
+	WRTE,R0	FDCMD	restore
+W2	REDE,R0	FDINT
+	BCFR,N	W2
+	LODA,R0	TRK,R1
+	WRTE,R0	FDDAT	Track
+	LODI,R0	1C+TTD	Seek with HLD and Ver
+	WRTE,R0	FDCMD
+W3	REDE,R0	FDINT
+	BCFR,N	W3
+	REDE,R0	FDCMD
+	TMI,R0	RNF	Seek error?
+	BCFR,EQ	SKD
+	LODI,R2	A'S'	Seek error - can't find track
+IERR	BCTA,UN	ERR
+* MicroDOS		PAGE 19
+DIRF	ADDI,R3	18	Advance 1 dir entry
+	LODA,R0	SEC,R1	directory sector
+	BRNR,R3	DIR2
+	ADDI,R0	1	next directory sector
+	LODI,R3	10	All start at byte 10
+	BSTR,UN	DIR2	Save directory location
+	BCTA,UN	RDNXSC	Load next sector of dir
+
+DIR2	STRA,R0	DSEC,R1	Save directory sector
+	LODZ,R3
+	STRA,R0	DBYT,R1	Start of directory entry
+	COMZ,R0	Start of directory entry
+	RETC,UN
+
+* Find first file satisfying a spec at *BUFF
+* Only R1 preserved; 3 subr levels
+* Returns R0 := 0 non-disc; -1 not found; 1 found
+
+FIND	STRA,R2	SR2	Save R2,R3
+	STRA,R3	SR3
+	BSTA,UN	ASGN	set name from *BUFF to NAME
+	LODA,R0	DRV,R1
+	SUBI,R0	-1	if not disk,
+	RETC,Z	if not disk,
+FIND1	BSTA,UN	STDR
+	RETC,N	disc error
+	LODI,R3	10-18
+	BCTR,UN	GDEN
+
+* Find next file satisfying a wildcard spec
+* Only R1 Preserved; 3 subr levels
+* Returns R0 := -1 non-disc or not found; 1 found
+
+FNEXT	LODA,R0	DRV,R1	Not found if
+	RETC,N	Not found if
+	BSTA,UN	STMP	Setup TMP
+	BSTA,UN	ASNAME	set name from *BUFF to NAME
+
+FNX	LODA,R0	DBYT,R1	last directory byte
+	STRZ,R3
+
+* Get next non-deleted directory entry
+GDEN	BSTA,UN	DIRF	Skip whole entry if null
+	RETC,N	Skip whole entry if null
+	LODA,R0	*TMP,R3	Look at 1st char of name
+	RETC,N	Look at 1st char of name
+	BCTR,Z	GDEN	deleted entry
+* Copy directory entry to DENT
+	LODI,R2	-1
+	SUBI,R3	1
+GDL	LODA,R0	*TMP,R3+	COPY from buffer
+	STRA,R0	DENT,R2+	to DENT
+	COMI,R2	18-1
+	BCFR,EQ	GDL
+* Compare with NAME
+	LODI,R2	0D
+COMPAR	LODA,R0	NAME,R2-
+* MicroDOS		PAGE 20
+	COMI,R0	A'?'
+	BCTR,EQ	MATCH
+	COMA,R0	DENT,R2
+	BCFA,EQ	FNX	no match
+MATCH	BRNR,R2	COMPAR
+	LODI,R0	1	Flag as found
+	RETC,UN
+* MicroDOS		PAGE 21
+* Error handling routine
+ERR	STRA,R0	ERR17	1771 Status
+	LODZ,R2
+ERRM	STRA,R0	ERRTYP
+	CPSL	RS+WC
+	STRA,R1	ERRSTR	Error stream
+	LODA,R0	DRV,R1	Save drive #
+	STRA,R0	ERRDR
+	LODA,R0	TRK,R1	Save track
+	STRA,R0	ERRTRK
+	LODA,R0	SEC,R1	Save sector
+	STRA,R0	ERRSEC
+	LODA,R0	ERRH
+	ANDI,R0	80	force 80 error code
+	RETC,N	force 80 error code
+	BRNR,R1	ERRP	Error not on stream 0
+	BSTA,UN	VDU0	Setup VDU stream 0
+ERRP	LODI,R0	8+TTD	Restore
+	WRTE,R0	FD1771
+	LODI,R3	ERRMSG-STR
+	BSTA,UN	PRCR
+	LODA,R0	ERRTYP
+	BSTA,UN	IO
+	BCTA,UN	ENTERK	to command level
+
+* Print filename from DENT (Directory ENTry)
+* Use str in R1 (can write to disk, etc)
+* Saves R1,R2; M+1 subr levels
+
+PNAM	LODI,R3	-1
+PNAM2	LODA,R0	DENT,R3+
+	BCTR,Z	CPN
+	BSTA,UN	IO
+CPN	COMI,R3	0A-1
+	BCFR,EQ	$+7
+	LODI,R0	A'.'
+	BSTA,UN	IO
+	COMI,R3	0D-1
+	BCFR,EQ	PNAM2
+	RETC,UN
+* MicroDOS		PAGE 22
+* Print R2R3 as decimal to stream R1
+* R2R3 NOT preserved; M+2 subr levels
+DOUT	STRA,R1	SAVE	Save stream no.
+	LODI,R1	0	Hundreds
+	PPSL	WC+CAR+LCOM
+LP1	LODZ,R2
+	BCFR,Z	D1
+	COMI,R3	D'100'
+	BCTR,LT	P1
+D1	SUBI,R3	D'100'	Subt dec 100
+	SUBI,R2	0
+	BIRR,R1	LP1
+P1	CPSL	WC
+	LODZ,R1
+	STRZ,R2	Save hundreds
+	BSNR,R0	PRDG	Print digit unless zero
+	LODI,R1	0
+LP2	COMI,R3	D'10'
+	BCTR,LT	P2
+	SUBI,R3	D'10'
+	BIRR,R1	LP2
+P2	LODZ,R1
+	BRNR,R2	FORC	If hunds, force tens
+	BSNR,R0	PRDG	Print tens
+UNS	LODZ,R3	Print tens
+PRDG	ADDI,R0	A'0'	Print digit
+	LODA,R1	SAVE
+	BCTA,UN	IO
+
+FORC	BSTR,UN	PRDG
+	BCTR,UN	UNS
+
+* Locate next item in buffer
+* Saves R1,R2; single subr level
+* IF leading "=" point to next non-sep char
+* ELSE skip till sep char
+* IF trailing "=" point to "=" ELSE skip trailing seps
+* IF CR - no item cc :- EQ
+ITEM	LODI,R3	-1
+ITEML	LODA,R0	*BUFF,R3+
+	COMI,R0	A','
+	BCTR,EQ	SEPS
+	COMI,R0	A'='
+	BCFR,EQ	NTEQ
+	BRNR,R3	IGO	ABC=
+	BCTR,UN	SEPS	=ABC
+NTEQ	COMI,R0	SPAC
+	BCTR,GT	ITEML	Skip anything significant
+IT2	COMI,R0	CR
+	RETC,EQ	CC = EQ => no item found
+SEPS	LODA,R0	*BUFF,R3+
+	COMI,R0	SPAC
+	BCFR,GT	IT2	Skip trailing seps
+IGO	ADDA,R3	BUFF+1	Update BUFF
+	STRA,R3	BUFF+1
+	RETC,UN	Ignore carry
+* MicroDOS		PAGE 23:
+* Accept line of Chars, put to BUF
+* Handles various control chars
+* Converts to upper case in buffer
+* No regs saved! 2+M subr levels, where
+* M is levels of COUT (normally M=3)
+PRT	LODI,R3	CTU-STR
+	BSTA,UN	PRNT	" ^U", CR, LF
+
+LINE	LODI,R3	1
+	LODI,R0	<BUF	Point to normal
+	STRA,R0	BUFF	line buffer
+	LODI,R0	>BUF
+	STRA,R0	BUFF+1
+LLOP	LODI,R1	10
+	BSTA,UN	IO	Input from strm 10
+	COMI,R0	01	Cntrl A ?
+	BCTA,EQ	22
+	COMI,R0	03	Cntrl C / ETX?
+	BCTA,EQ	ENTERK
+	COMI,R0	12	Cntrl R ?
+	BCTR,EQ	CRLF0
+	COMI,R0	15	Cntrl U ?
+	BCTR,EQ	PRT
+	COMI,R0	7F	DELETE ?
+	BCTR,EQ	N7
+	COMI,R0	BS	BS ?
+	BCFR,EQ	N8
+N7	SUBI,R3	1	backspace
+	BCTR,Z	LINE
+	LODI,R0	BS
+B0B	BCTR,UN	N9
+N8	COMI,R0	CR
+	BCTR,EQ	LEND	Exit on CR
+	COMI,R3	3F	full ?
+	BCTR,EQ	LLOP	Ignore on buffer full
+	STRA,R0	BUF-2,R3+
+N9	LODI,R1	0
+	BSTR,UN	IO
+	BCTR,UN	LLOP
+
+LEND	STRA,R0	BUF-2,R3+	Store CR in buffer
+
+CRLF0	LODI,R1	0	Put CRLF on stream 0
+
+* Put CR,LF on stream R1
+
+CRLF	LODI,R0	CR
+	BSTR,UN	IO
+	LODI,R0	LF
+* MicroDOS		PAGE 24
+* Do one byte of 1/0 on stream R1
+* Saves R1-R3; same subr levels as service routine
+IO	STRA,R0	SR0
+	LODA,R0	IDNT,R1
+	BCFR,Z	IOPN
+	LODI,R0	A'O'
+	BCTA,UN	ERRM	Stream not open
+IOPN	LODA,R0	CODE,R1
+	STRA,R0	ADR
+	LODA,R0	CODE+1,R1
+	STRA,R0	ADR+1
+	LODA,R0	SR0
+	BCTA,UN	*ADR	Execute
+
+PRID	LODI,R3	IDM-STR
+	BCTR,UN	PRNT
+
+PRCR	BSTR,UN	CRLF0
+PRNT	LODI,R1	0	Print string on stream 0
+PRNT2	LODA,R0	STR-1,R3+
+	RETC,Z
+	BSTR,UN	IO
+	BCTR,UN	PRNT2
+
+* Read non-disk device
+RDND	LODI,R3	2
+RDNDL	CPSL	RS
+	BSTA,UN	IO	Must Preserve R3
+	PPSL	RS
+	BIRR,R3	RDNDL
+	CPSL	RS
+	RETC,UN
+
+* Write buffer to non-disk dev
+WRND	LODI,R3	2
+WRNDL	LODA,R0	*TMP,R3
+	CPSL	RS
+	BSTA,UN	IO
+	PPSL	RS
+	BIRR,R3	WRNDL
+	CPSL	RS
+	RETC,UN
+
+
+* Print R0 as hex on str R1
+* Equiv Mon BOUT
+* Saves R1-R3; M+1 subr levels
+HXOUT	STRA,R0	SAVE
+	RRR,R0
+	RRR,R0
+	RRR,R0
+	RRR,R0
+	BSTR,UN	HOUT
+	LODA,R0	SAVE
+* MicroDOS		PAGE 25
+HOUT	ANDI,R0	0F
+	ADDI,R0	A'0'
+	COMI,R0	A'9'
+	BCFR,GT	$+4
+	ADDI,R0	7	If A-F, add 7
+	BCTA,UN	IO
+* MicroDOS		PAGE 26
+* Get number from buffer to XGOTO
+* Equiv Mon GNUM
+* Saves R1-R3; 2 subr levels
+* CC - EQ if valid HEX number
+GNMB	PPSL	LCOM+RS+WC
+	EORZ,R0
+	STRZ,R1
+	STRZ,R2
+	LODI,R3	-1
+LNUM	STRA,R0	SR0
+	BSTA,UN	GETSEP	set char from buffer
+	BCTR,EQ	DNUM	Seperator
+	PPSL	CAR
+	SUBI,R0	A'0'	Leaves carry on
+	BCTR,N	HERR	Invalid delimiter
+	COMI,R0	9
+	BCFR,GT	GNOK	0-9 is OK
+	SUBI,R0	7
+	COMI,R0	0A	Else should be A
+	BCTR,LT	HERR
+	COMI,R0	0F	to F
+	BCTR,GT	HERR
+GNOK	RRL,R2	Shift R1R2 left 4 bits
+	RRL,R1
+	RRL,R2
+	RRL,R1
+	RRL,R2
+	RRL,R1
+	RRL,R2
+	RRL,R1
+	ANDI,R2	0F0
+	IORZ,R2	Include new digit
+	STRZ,R2
+	LODI,R0	1
+	BCTR,UN	LNUM	Set Byte flag and loop for next
+
+HERR	CPSL	RS+WC+LCOM
+	RETC,UN
+
+DNUM	COMI,R0	CR
+	BCTR,EQ	OUTX	end of buffer
+	LODA,R0	SR0	Found No Yet?
+	BCTR,Z	LNUM	Ignore leading spaces
+OUTX	CPSL	WC
+	BSTA,UN	IGO	Update BUFF
+	STRA,R1	XGOTO
+	STRA,R2	XGOTO+1
+	LODZ,R1	Return high order in R0
+	CPSL	RS+H'C0'
+	RETC,UN
+* MicroDOS		PAGE 27
+VDU	COMI,R0	4	Simple VDU dev handler
+	RETC,LT
+	BCTA,UN	COUT
+
+* Return version number; CC = P
+DVRS	BRNR,R0	DVRS1
+	LODI,R0	VERS
+	RETC,UN
+DVRS1	COMZ,R0
+	RETC,UN
+
+* Device table
+DEVS	DATA	A'VD' VdU
+	ACON	VDU
+	DATA	A'KB' Keyboard
+	ACON	KBD
+	DATA	A'LP' Printer (LPT:)
+	ACON	POUT
+	DATA	0FF
+
+VDUB	DATA	A'VDU'
+	ACON	VDU
+	DATA	0,0FF
+KBDB	DATA	A'KBD'
+	ACON	KBD
+	DATA	0,0FF
+
+STR	DATA	9,9
+IDM	DATA	A'MicroDOS v4.5',0
+PMT	DATA	A'::',0
+CTU	DATA	A' ^U',CR,LF,0
+NOTF	DATA	A'File not found...',0
+ERRMSG	DATA	A'Error - ',0
+STRTUP	ACON	KOLD
+KOLD	DATA	A'1:ST.SYS',CR
+
+DSKD	DATA	A'DSK'
+CMDS	DATA	A'CMD'
+
+CR	EQU	0D
+LF	EQU	0A
+BS	EQU	08
+SPAC	EQU	20
+
+COUT	EQU	02B4 Monitor
+KBD	EQU	0286
+* MicroDOS			PAGE 28
+	ORG	RAM
+IDNT	RES	3 Stream identity, 3 chars
+CODE	RES	2 Addr of service routine
+PBPT	RES	1 Program Buffer PoinTer
+DRV	RES	1 Bit 1,0=drv #; bit 2=side
+TRK	RES	1 Track #
+SEC	RES	1 Sector #
+DSEC	RES	1 Directory sector
+DBYT	RES	1 Dir byte
+HLEN	RES	1 Lensth (for
+LLEN	RES	1 writes)
+FTYP	RES	1 File type (0=ordinary)
+DBPT	RES	1 Device Buffer Pointer
+HBUF	RES	1 High byte of buffer addr
+
+	ORG	RAM+60
+
+	RES	3
+NAME	RES	0A
+EXTN	RES	3
+
+BUFF	RES	2 Line buffer pointer
+BUF	RES	40 Normal line buffer
+TRK1	RES	4 Track info for dual drive
+DENT	RES	18 Directory ENTry copy
+DENP	RES	4 Scratch
+ADR	EQU	DENP
+SR2	RES	1
+SR3	RES	1
+SR0	EQU	SR2
+SAVE	EQU	SR3
+RTYCNT	RES	1 retry count
+CDRV	RES	1 Current drive
+	RES	1
+SYSD	RES	1 Sys drive
+WRKD	RES	1 Work dry
+	RES	2
+TMP	RES	2 Disk buffer pointer
+XGOTO	RES	2 Res of GNUM
+ERRDR	RES	1 Error drive
+ERRTYP	RES	1 Error type
+ERRSTR	RES	1 Error stream
+ERRTRK	RES	1 Error track
+ERRSEC	RES	1 Error sector
+ERR17	RES	1 1771 error status
+ERRH	RES	1 Error handling flag
+
+CLEAR	EQU	$
+	ORG	RAM+0F0
+POUT	RES	3 Printer COUT
+PINIT	RES	3 Printer Initialise
+PTERM	RES	3 Printer Terminate
+TSTBRK	RES	3 Test for break
+
+DATV	RES	1 Date valid flag
+DATE	RES	3 DD,MM,YY in BCD

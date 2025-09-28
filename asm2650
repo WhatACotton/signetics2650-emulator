@@ -1,0 +1,1343 @@
+#!/usr/bin/env python3
+# tabs = 4
+
+VersionString = "2.2.2"
+
+"""
+This program is a 2650 assembler, based on the assembler published on
+https://binnie.id.au/MicroByte/
+
+It is modified to provide error checking and warnings, and to support
+the sytax used by the DASMx disassembler as well as the standard Signetics format.
+Note that the Microbyte assembler syntax uses a different notation on auto-increment
+and auto-decrement: "R3-" and "R2+" instead of "R3,-" and "R2,+". This assembler
+accepts either notation.
+
+
+The assembler is case-insensitive, but case-preserving.
+
+Support for the 2650B processor has been added (additional instructions LDPL, STPL)
+
+"""
+
+# The code below uses a number of debugging output statements, using pBlue().
+# These are normally commented out.
+
+import sys, os, re
+from collections import namedtuple
+
+# Signetics 2650 assembler Pseudo-ops.
+# Some of these are accepted but ignored: END, EJE, PRT, SPC, TITL, PCH, PAG, START
+# Additions:
+# - both DATA and DB can be used to specify memory contents.
+# - both ACON and DW can be used to specify address constants.
+# - DFLT can be used to set the default numbering style ('1' or '16' for hexadecimal, '0' or '10' for decimal)
+# If no DFLT is specified decimal numbering is assumed for compatibility.
+Pseudo =  ('ORG', 'EQU', 'RES', 'END', 'ACON', 'DW', 'DATA', 'DFLT', 'DB', 'EJE', 'PRT', 'SPC', 'TITL', 'PAG', 'PCH', 'START')
+
+# Table of 2650 Instruction Mnemonic Codes
+MNEC = {
+	# Load/Store
+	'LODZ': 0x00, 'LODI': 0x00+4, 'LODR': 0x00+8, 'LODA': 0x00+12,
+	'STRZ': 0xC0, 'STRI': 0xC0+4, 'STRR': 0xC0+8, 'STRA': 0xC0+12,
+	# Arithmetic
+	'ADDZ': 0x80, 'ADDI': 0x80+4, 'ADDR': 0x80+8, 'ADDA': 0x80+12,
+	'SUBZ': 0xA0, 'SUBI': 0xA0+4, 'SUBR': 0xA0+8, 'SUBA': 0xA0+12,
+	# Logical
+	'ANDZ': 0x40, 'ANDI': 0x40+4, 'ANDR': 0x40+8, 'ANDA': 0x40+12,
+	'IORZ': 0x60, 'IORI': 0x60+4, 'IORR': 0x60+8, 'IORA': 0x60+12,
+	'EORZ': 0x20, 'EORI': 0x20+4, 'EORR': 0x20+8, 'EORA': 0x20+12,
+	# Comparison
+	'COMZ': 0xE0, 'COMI': 0xE0+4, 'COMR': 0xE0+8, 'COMA': 0xE0+12,
+	# Rotate
+	'RRR': 0x50,
+	'RRL': 0xD0,
+	# Branch
+	'BCTR': 0x18, 'BCTA': 0x18+4,
+	'BCFR': 0x98, 'BCFA': 0x98+4,
+	'BRNR': 0x58, 'BRNA': 0x58+4,
+	'BIRR': 0xD8, 'BIRA': 0xD8+4,
+	'BDRR': 0xF8, 'BDRA': 0xF8+4,
+	'BXA': 0x9F,
+	'ZBRR': 0x9B,
+	# Subroutine/Return
+	'BSTR': 0x38, 'BSTA': 0x38+4,
+	'BSFR': 0xB8, 'BSFA': 0xB8+4,
+	'BSNR': 0x78, 'BSNA': 0x78+4,
+	'BSXA': 0xBF,
+	'RETC': 0x14, 'RETE': 0x34,
+	'ZBSR': 0xBB,
+	# Program/Status
+	'LPSU': 0x92, 'LPSL': 0x92+1,
+	'SPSU': 0x12, 'SPSL': 0x12+1,
+	'CPSU': 0x74, 'CPSL': 0x74+1,
+	'PPSU': 0x76, 'PPSL': 0x76+1,
+	'TPSU': 0xB4, 'TPSL': 0xB4+1,
+	# Input/Output
+	'REDC': 0x30, 'REDD': 0x70, 'REDE': 0x54,
+	'WRTC': 0xB0, 'WRTD': 0xF0, 'WRTE': 0xD4,
+	# Misc
+	'HALT': 0x40,
+	'DAR': 0x94,
+	'TMI': 0xF4,
+	'NOP': 0xC0,
+	# 2650B only
+	'LDPL': 0x10,
+	'STPL': 0x11
+}
+
+# Symbol Table, pre-populated with constants
+# Any user-defined labels will be added to the table.
+# The index-strings in the table *must* be upper-case.
+
+CustomSymtab = { }
+SYMTAB = {
+	# registers
+	'R0': 0,
+	'R1': 1,
+	'R2': 2,
+	'R3': 3,
+	# Condition codes
+	'EQ': 0, # equal
+	'GT': 1, # greater than
+	'LT': 2, # less than
+	'UN': 3, # unconditional
+	'Z': 0,	 # zero
+	'P': 1,	 # positive
+	'N': 2,	 # negative
+	'NE': 2, # Not Equal, for TMI instruction
+	# PSW upper
+	'SENS': 0x80,
+	'FLAG': 0x40,
+	'II': 0x20,
+	# PSW lower
+	'IDC': 0x20,
+	'RS': 0x10,
+	'WC': 0x08,
+	'OVF': 0x04,
+	'LCOM': 0x02,
+	'CAR': 0x01
+}
+
+def addrModeAndLength(opcd):
+	"""
+	opcd *must* be a valid opcode!
+	Determine Addressing mode (below) and instruction length (1, 2, 3).
+	 mode	S	len reg/cc	opnd	indirct indexed X-page	example
+	  Z		Z	1	Y		N		N		N		N		LODZ,r1
+	  ZM	E	1	N		N		N		N		N		HALT
+	  I		I	2	Y		Y		N		N		N		LODI,r0 5
+	  IM	EI	2	N		Y		N		N		N		CPSL RS
+	  R		R	2	Y		Y		Y/N		N		N		STRR,r0 $+5 / BCTR,UN $+5
+	  R0	ER	2	N		Y		Y/N		N		N		ZBRR 5
+	  A		A	3	Y		Y		Y/N		Y/N		N		LODA,r0 ADDR,R1,+
+	  AB	B	3	Y		Y		Y/N		N		Y		BCTA,GT ADDR
+	  A3	EB	3	N		Y		Y/N		Y(R3)	Y		BXA ADDR,R3
+	  AC	C	3	N		Y		Y/N		N		Y		LDPL ADDR (2650B only)
+	We use this many addressing modes to assist in error checking.
+	The S-column corresponds to the Format specification in the Signetics CPU manual.
+	"""
+	if len(opcd)==3: opcd += " "
+	# special branches
+	if opcd[:2]=='ZB':	# Zero Branch
+		return 'R0', 2
+	if opcd=='BXA ' or opcd=='BSXA':
+		return 'A3', 3
+	# Structured opcodes
+	if opcd[3]=='Z':	# Immediate
+		return 'Z', 1
+	if opcd[3]=='I':	# Immediate
+		return 'I', 2
+	if opcd[3]=='R':	# Relative
+		return 'R', 2
+	if opcd[0]=='B':	# Branch (absolute)
+		return 'AB', 3
+	if opcd[3]=='A':	# Absolute
+		return 'A', 3
+	# Other opcodes
+	if opcd=='TMI ' or opcd=='WRTE' or opcd=='REDE':
+		return 'I', 2
+	if opcd[:3]=='CPS' or opcd[:3]=='PPS' or opcd[:3]=='TPS':
+		return 'IM', 2
+	if opcd[:3]=='LPS' or opcd[:3]=='SPS':
+		return 'ZM', 1
+	if opcd=='LDPL' or opcd=='STPL':
+		return 'AC', 3
+	if opcd=='HALT' or opcd=='NOP ':
+		return 'ZM', 1
+	# the rest
+	return 'Z', 1
+
+# Patterns for tokens that can make up the operand
+NAME =	r'(?P<NAME>[a-zA-Z_][a-zA-Z_0-9]*)'
+HEXLS = r"(?P<HEXLS>[Hh]'[a-fA-F0-9][a-fA-F0-9,]*[a-fA-F0-9]')"
+HEX =	r"(?P<HEX>[Hh]'[a-fA-F0-9]+')"
+OCTLS = r"(?P<OCTLS>[Oo]'[0-7][0-7,]*[0-7]')"
+OCT =	r"(?P<OCT>[Oo]'[0-7]+')"
+BINLS = r"(?P<BINLS>[Bb]'[0-1][0-1,]*[0-1]')"
+BIN =	r"(?P<BIN>[Bb]'[0-1]+')"
+DHEX =	r"(?P<DHEX>\$[a-fA-F0-9]+)"
+# a-quote-something-quote, where something is a repetition of EITHER a non-quote OR quote-quote
+ASCII = r"(?P<ASCII>[Aa]'([^']|(''))*')"
+# dquote-something-dquote, where something is a repetion of EITHER a non-dquote OR dquote-dquote
+ASTR =	r"(?P<ASTR>\"([^\"]|(\"\"))*\")"
+DECLS = r"(?P<DECLS>[Dd]'\d[\d,]+\d')"
+DEC =	r"(?P<DEC>[Dd]'\d+')"
+NUM =	r'(?P<NUM>[\+\-]?\d[a-fA-F0-9]*)'	# base is set by the DFLT pseudo-op
+OPEN =	r'(?P<OPEN>\()'
+CLOSE = r'(?P<CLOSE>\))'
+SHL =	r'(?P<SHL>\<\<)'
+SHR =   r'(?P<SHR>\>\>)'
+TIMES =	r'(?P<TIMES>\*)'
+DIV =   r'(?P<DIV>/)'
+MOD =   r'(?P<MOD>%)'
+PLUS =	r'(?P<PLUS>\+)'
+MINUS = r'(?P<MINUS>-)'
+LAND =  r'(?P<LAND>&)'
+LOR =   r'(?P<LOR>\|)'
+LXOR =  r'(?P<LXOR>\^)'
+SELF =	r'(?P<SELF>\$(?![a-fA-F0-9]))'
+UPPER = r'(?P<UPPER>\<(?!\<))'
+LOWER = r'(?P<LOWER>\>(?!\>))'
+INDEX = r'(?P<INDEX>,[Rr][0-3](?![a-zA-Z_0-9])(,?[+-])?)'
+SEP =	r'(?P<SEP>,\s*)'
+COMMENT=r'(?P<COMMENT>\s.*)'
+CATCHALL=r'(?P<CATCHALL>.+)'
+
+operand_pat = re.compile('|'.join([UPPER, LOWER, HEX, DHEX, HEXLS, DEC, DECLS, OCT, OCTLS, BIN, BINLS, ASCII, ASTR, INDEX, NAME, NUM, OPEN, CLOSE, SHL, SHR, TIMES, DIV, MOD, PLUS, MINUS, LAND, LOR, LXOR, SELF, SEP, COMMENT, CATCHALL]))
+
+_Token = namedtuple('Token', ['type','value'])
+
+# Function to scan Operand and generate a list of Named Tuple
+def generate_tokens(pat, text):
+	scanner = pat.scanner(text)
+	l = []
+	for m in iter(scanner.match, None):
+		#yield _Token(m.lastgroup, m.group())
+		l.append(_Token(m.lastgroup, m.group()))
+	return l
+
+class LabelNotFoundException(Exception):
+	""" custom exception on errors with referenced symbols """
+
+class AsmException(Exception):
+	""" custom exception on general errors (not missing labels) """
+
+class Assembler:
+	"""
+	This class provides the assembler's processing
+
+	Any errors will be raised as exceptions (as above).
+	"""
+	def __init__(self):
+		self.initPass(0)
+
+	def initPass(self, Pass):
+		global lineno, errors, defaultHex
+		self.Pass = Pass
+		self.CmdLength = 0
+		self.PC = 0 # Program Counter
+		self.nextPC = 0
+		self.DFLT = 16 if defaultHex else 10 # default base for numerical constants
+		self.Origin = None
+		self.codesection = 0			# Each ORG starts a new section
+		self.codesectionslength = [0]	# Number of output bytes in each code section
+		self.initLine('')
+		lineno = 0
+		errors = 0
+
+	def initLine(self,line):
+		self.PC = self.nextPC + self.CmdLength
+		self.nextPC = self.PC # Program Counter after instruction
+		self.OPCD = None	  # Resolved numeric value of opcode
+		self.AddrMode = None  # opcode address mode
+		self.CmdLength = 0	  # instruction length in bytes (can be any length, e.g. with DATA pseudo)
+		self.targetregister=0 # register on which the instruction operates
+		self.OPND = None	  # Resolved Operand
+		self.Comment = ""	  # Resolved comment
+		self.DataBytes = []	  # Result os raw bytes
+		self.Listing = ""	  # Result as text line listing
+		self.line = line      # current line from input file
+
+	def warnline(self,w):
+		if not self.Comment or not re.search(r'NOWARN',self.Comment):
+			pwarn(w, self.line)
+
+	def evaluateToken(self, tok):
+		"""
+		Evaluate token
+		Returns	 an integer value (NAME, NUM, HEX, DEC, SELF), a list of integer values
+		(HEXLS, DECLS, ASCII, ASTR), or a string (COMMENT).
+		This ASCII and ASTR strings can be one character long, in which case they are
+		a valid operand for Immediate instructions, such as LODI,RO "@" .
+		May raise LabelNotFoundException or AsmException
+		"""
+		if tok.type=='NAME':
+			try:
+				return SYMTAB[tok.value.upper()]
+			except:
+				if self.Pass==1: raise LabelNotFoundException("Undefined symbol " + tok.value)
+				return 0
+		if tok.type=='NUM':
+			try:
+				return int(tok.value, self.DFLT) # convert to Decimal/Hex
+			except:
+				raise AsmException("Invalid number for base-" + str(self.DFLT))
+				return 0
+		if tok.type=='HEXLS':
+			return list(map(inthex, tok.value[2:-1].split(',')))
+		if tok.type=='HEX':
+			return int(tok.value[2:-1], 16)
+		if tok.type=='DHEX':
+			return int(tok.value[1:], 16)
+		if tok.type=='OCTLS':
+			return list(map(intoct, tok.value[2:-1].split(',')))
+		if tok.type=='OCT':
+			return int(tok.value[2:-1], 8)
+		if tok.type=='BINLS':
+			return list(map(intbin, tok.value[2:-1].split(',')))
+		if tok.type=='BIN':
+			return int(tok.value[2:-1], 2)
+		if tok.type=='DECLS':
+			return list(map(int, tok.value[2:-1].split(',')))
+		if tok.type=='DEC':
+			return int(tok.value[2:-1])
+		if tok.type=='ASCII':
+			s = tok.value[2:-1]
+			s = re.sub("''", "'", s)	# flatten two quotes
+			return list(map(ord, s))
+		if tok.type=='ASTR':
+			s = tok.value[1:-1]
+			s = re.sub(r'\\x([0-9a-f][0-9a-f])', convert_code_to_char, s, flags=re.IGNORECASE)
+			s = re.sub('""', '"', s)	# flatten two doublequotes
+			return list(map(ord, s))
+		if tok.type=='SELF':
+			return self.PC
+		if tok.type=='COMMENT':
+			return tok.value
+		if tok.type=='CATCHALL':
+			raise AsmException("Invalid expression '%s'" % str(tok.value))
+
+	def eval(self,tokens,prio,sublevel):
+		"""
+		Evaluate a list of tokens, where 'prio' is the priority of the current
+		operation. This means that evaluation should stop when an operator
+		is encountered with a priority <= than 'prio'.
+		Priority/precedence:
+		-1 = ( )		parentheses
+		 0 =  <, > 		high byte, low byte
+		 1 =  , 		list concatenation
+		 2 =  ^ | 		logical XOR, logical OR
+		 3 =  & 		logical AND
+		 4 =  << >>		shift left, shift right
+		 5 =  + -		addition, subtraction
+		 6 =  * / %		multiplication, division, modulo
+		Use parentheses (...) to group expressions
+		Returns:
+		- value: the evaluated value of the expression
+		- indexreg: value of the index register (or None)
+		- status of autoincrement (or None)
+		- bracket sublevel (same as sublevel calling parameter, except after closing bracket)
+		- list of tokens that have not been evaluated
+		"""
+		global args
+		value = None
+		indexreg = None
+		autoinc = None
+
+		if args.debug>=2 and self.Pass==1: pRed(tokens)
+		while len(tokens)>0:
+			tok = tokens[0]
+			if args.debug>=2 and self.Pass==1: pBlue("  %s" % str(tok))
+			prevtokens = tokens
+			tokens = tokens[1:]
+			if tok.type=='COMMENT':
+				## strip leading whitespace
+				comment = re.sub(r'^\s+', '', tok.value)
+				self.Comment = comment
+				continue
+			if tok.type=='OPEN':
+				(value, indexreg, autoinc, sublevel, tokens) = self.eval(tokens,-1,sublevel+1)
+				continue;
+			if tok.type=='CLOSE':
+				sublevel -= 1
+				break;
+			if tok.type=='UPPER' or tok.type=='LOWER':
+				(value, indexreg, autoinc, sublevel, tokens) = self.eval(tokens,0,sublevel)
+				if value==None or type(value) is not int:  raise AsmException("Invalid expression")
+				if value<0: value += 256
+				if tok.type=='UPPER':  value >>= 8 # return upper byte
+				if tok.type=='LOWER':  value &= 0xFF # return lower byte
+				continue
+			# Binary operators
+			if tok.type in ('SHL','SHR','TIMES','DIV','MOD','PLUS','MINUS','LAND','LOR','LXOR'):
+				if tok.type in ('LOR','LXOR'):			newprio = 2
+				elif tok.type in ('LAND'):				newprio = 3
+				elif tok.type in ('PLUS','MINUS'):		newprio = 4
+				elif tok.type in ('SHL','SHR'):			newprio = 5
+				elif tok.type in ('TIMES','DIV','MOD'):	newprio = 6
+				else:  raise AsmException("Invalid operator")
+				if prio>=newprio:  return (value, indexreg, autoinc, sublevel, prevtokens)
+				# List demotion when calculating and length==1
+				if type(value) is list and len(value)==1:  value = value[0]
+				leftv = value
+				if leftv==None or type(leftv) is not int:  raise AsmException("Invalid expression (missing/invalid left operand to '%s')" % tok.value)
+				(rightv, indexreg, autoinc, sublevel, tokens) = self.eval(tokens,newprio,sublevel)
+				if type(rightv) is list and len(rightv)==1:  rightv = rightv[0]
+				if rightv==None or type(rightv) is not int:  raise AsmException("Invalid expression (missing/invalid right operand to '%s')" % tok.value)
+				if tok.type in ('DIV','MOD') and rightv==0:	raise AsmException("Invalid expression (div/mod by zero')")
+				if tok.type=='PLUS' :  value = leftv  + rightv
+				if tok.type=='MINUS':  value = leftv  - rightv
+				if tok.type=='TIMES':  value = leftv  * rightv
+				if tok.type=='DIV'  :  value = leftv // rightv
+				if tok.type=='MOD'  :  value = leftv  % rightv
+				if tok.type=='SHL'  :  value = leftv << rightv
+				if tok.type=='SHR'  :  value = leftv >> rightv
+				if tok.type=='LAND' :  value = leftv  & rightv
+				if tok.type=='LOR'  :  value = leftv  | rightv
+				if tok.type=='LXOR' :  value = leftv  ^ rightv
+				if args.debug>=3 and self.Pass==1:  pRed("%s %s %s = %s" % (leftv,tok.type,rightv,value))
+				continue
+			if tok.type=='SEP':
+				if prio>1:  return (value, indexreg, autoinc, sublevel, prevtokens)
+				if value==None:  raise AsmException("Invalid expression (missing left operand to ',')")
+				# start making a list
+				if type(value) is int:  value = [value]
+				(rightv, indexreg, autoinc, sublevel, tokens) = self.eval(tokens,1,sublevel)
+				if rightv==None:  raise AsmException("Invalid expression (missing right operand to ',')")
+				if type(rightv) is int:  value.append(rightv)
+				if type(rightv) is list:  value = value+rightv
+				continue
+			if tok.type=='INDEX':
+				# Value is like ",R2" or like ",R1-" or like ",R3,+"
+				if indexreg!=None:	raise AsmException("Multiple index registers not allowed")
+				if tok.value[-1]=='+':
+					regval = tok.value[1:-2] if tok.value[-2]==',' else tok.value[1:-1]
+					autoinc = 1
+				elif tok.value[-1]=='-':
+					regval = tok.value[1:-2] if tok.value[-2]==',' else tok.value[1:-1]
+					autoinc = 2
+				else:
+					regval = tok.value[1:]
+					autoinc = 3
+				newtok = _Token('NAME', regval)
+				indexreg = self.evaluateToken(newtok)
+				if len(tokens)>0 and (len(tokens)!=1 or tokens[0].type!='COMMENT'):
+					raise AsmException("Invalid expression after index register")
+				continue
+			# Must be a value
+			#pBlue("	 toktype=«%s», tokval=«%s»" % (tok.type,str(tok.value)))
+			v = self.evaluateToken(tok)
+			if value==None:
+				value = v
+			elif type(value) is int and type(v) is int:
+				# String "5+2" is tokenised as num:"5", num:"+2" and not as
+				# num:"5",oper:PLUS,num:"2". Similar for "5-2".
+				# We correct this by inserting a PLUS token between two consecutive numbers.
+				prevtokens.insert(0, _Token('PLUS', "+"))
+				tokens = prevtokens
+			elif type(value) is list and type(v) is int:
+				# Same as above. List demotion when value is a list of length 1
+				if len(value)==1:
+					prevtokens.insert(0, _Token('PLUS', "+"))
+					tokens = prevtokens
+				else: value.append(v)
+			elif type(value) is list and type(v) is list:
+				value = value + v
+			else:
+				raise AsmException("Invalid expression")
+
+		return (value, indexreg, autoinc, sublevel, tokens)
+
+	def evaluateExpression(self, operand):
+		"""
+		Take a string containing operand tokens (optionally followed by a comment),
+		and return a list containing:
+		- evaluated operand (list of values)
+		- indirect addressing (True/False)
+		- index register
+		- auto-increment (1 for increment, 2 for decrement, 3 for plain indexed)
+		All values (except 'indirect') may be None if not present
+		"""
+		#pBlue("	> operand=«%s»" % (operand))
+		# Indirection must be the very first character, cannot be specified inside the operand
+		indirect = False
+		if len(operand)>0 and operand[0]=='*':
+			indirect = True
+			operand = operand[1:]
+
+		tokens = generate_tokens(operand_pat, operand)
+		(value, indexreg, autoinc, sublevel, tokens) = self.eval(tokens,-1,0)
+		if sublevel<0:  raise AsmException("Invalid expression (unexpected closing bracket)")
+		if sublevel>0:  raise AsmException("Invalid expression (missing closing bracket)")
+		return (value, indirect, indexreg, autoinc)
+
+	def processinstruction(self, instr, rest):
+		"""
+		Resolve instr array [Opcode , {Register | Condition Code}]
+		instr[0] contains a valid opcode.
+		Sets global OPCD, AddrMode, CmdLength, Comment
+		"""
+		global relwarnings,instrwarnings
+		global sedfile, lineno, args
+		opcode = instr[0]
+		self.OPCD = MNEC[opcode]
+		self.AddrMode, self.CmdLength = addrModeAndLength(opcode)  # Determine Address mode/ length
+		if args.debug>=2 and self.Pass==1: pBlue("  >> opcode=«%s», addrmode=«%s», cmdlen=«%s»" % (opcode,self.AddrMode,self.CmdLength))
+
+		regcc = None
+		numregcc = None
+		# Process the register/cond.code field in the instruction part
+		if len(instr)==2 :
+			regcc = instr[1].upper()
+			if regcc=='':
+				raise AsmException("Missing register/condition")
+			elif regcc in SYMTAB: # Resolve register
+				numregcc = SYMTAB[regcc]
+			else:
+				raise AsmException("Unknown register/condition: " + regcc)
+		if args.debug>=2 and self.Pass==1: pBlue("  >> regcc=«%s», numregcc=«%s»" % (regcc,numregcc))
+
+		# Process the operand part
+		# Some instructions do not take any operand. In that case, the entire string 'rest' is a comment
+		if self.AddrMode=='ZM' or (self.AddrMode=='Z' and len(instr)==2):
+			opval = None
+			indirect = False
+			indexreg = None
+			autoinc = None
+			comment = rest
+			self.Comment = comment
+		else:
+			try:
+				(opval,indirect,indexreg,autoinc) = self.evaluateExpression(rest)
+				if opval!=None and type(opval) is not int:
+					if len(opval)==0:
+						raise AsmException("Unexpected empty list")
+					elif len(opval)>1:
+						#pRed(opval)
+						raise AsmException("Too many operands for instruction; list or string not permitted")
+					else:
+						opval = opval[0]
+			except LabelNotFoundException as err:
+				# Handle only during first pass, re-raise on Pass==1
+				if self.Pass==1: raise
+				# Fake the results to evaluateExpression()
+				opval = 0
+				indirect = False
+				indexreg = None
+				autoinc=None
+
+		if len(self.Comment)==0:
+			txtoperand = rest
+		elif self.Comment==rest:
+			txtoperand = ""
+		else:
+			txtoperand = rest[:-len(self.Comment)]
+		txtoperand = re.sub(r'^\s+', '', txtoperand)
+		txtoperand = re.sub(r'\s+$', '', txtoperand)
+
+		if args.debug>=2 and self.Pass==1: pBlue("  >> opval=«%s», indirect=«%s», indexreg=«%s», autoinc=«%s», comment=«%s»" % (opval,indirect,indexreg,autoinc,self.Comment))
+		if self.AddrMode=='Z' and len(instr)==1 and numregcc==None and 0<=opval<=3:
+			# Alternative notation for Zero-addressing is to specify the target register as the operand
+			# change "eorz	r0" into canonical notation "eorz,r0"
+			numregcc = opval
+			opval = None
+
+		# Error checking
+		# Opcodes
+		if (opcode=="ANDZ" and numregcc==0):
+			raise AsmException("ANDZ,R0 is not a valid instruction (consider IORZ,R0)")
+			if sedfile!=None: print("%ds/andz,r0/iorz,r0/i" % lineno, file=sedfile)
+		if (opcode=="STRZ" and numregcc==0):
+			raise AsmException("STRZ,R0 is not a valid instruction (consider IORZ,R0)")
+			if sedfile!=None: print("%ds/strz,r0/iorz,r0/i" % lineno, file=sedfile)
+
+		if (opcode=="LODZ" and numregcc==0 and self.Pass==1 and instrwarnings):
+			self.warnline("LODZ,R0 is discouraged (consider IORZ,R0)")
+			if sedfile!=None: print("%ds/lodz,r0/iorz,r0/i" % lineno, file=sedfile)
+		if (opcode=="COMZ" and numregcc==0) and self.Pass==1 and instrwarnings:
+			self.warnline("COMZ,R0 has predictable results",)
+		if (opcode=="PPSL" or opcode=="PPSU") and opval==0 and self.Pass==1 and instrwarnings:
+			self.warnline("PPSx has no effect (no bits set)")
+		if (opcode=="CPSL" or opcode=="CPSU") and opval==0 and self.Pass==1 and instrwarnings:
+			self.warnline("CPSx has no effect (no bits cleared)")
+		if (opcode=="TPSL" or opcode=="TPSU") and opval==0 and self.Pass==1 and instrwarnings:
+			self.warnline("TPSx has predictable results")
+		if opcode=="TMI" and opval==0 and self.Pass==1 and instrwarnings:
+			self.warnline("TMI has predictable results")
+
+		if not args.allow2650b:
+			if opcode=="PPSU" and opval&0x18!=0 and self.Pass==1 and instrwarnings:
+				self.warnline("Flags UF1 and UF2 cannot be set with 2650A")
+			if opcode=="TPSU" and opval&0x18!=0 and self.Pass==1 and instrwarnings:
+				self.warnline("TPSU has predictable results; flags UF1 and UF2 are always 0 with 2650A")
+
+
+		# Register or condition code
+		if self.AddrMode in ('ZM', 'IM', 'R0', 'AC') and numregcc!=None:
+			raise AsmException("Instruction %s does not take a register or condition code." % opcode)
+		if numregcc!=None and (numregcc<0 or numregcc>3):  raise AsmException("Invalid register or condition code " + instr[1])
+		if (opcode[0]=='B' and opcode[2]=='F' and numregcc==3):	 raise AsmException("Branch on false cannot be unconditional")
+		# Register addressing
+		if self.AddrMode=='Z' and numregcc==None:  raise AsmException("Missing register")
+		if self.AddrMode[0]=='Z' and opval!=None: raise AsmException("Register addressing cannot take an operand")
+		if self.AddrMode[0]=='Z' and indirect: raise AsmException("Indirect addressing not possible with Register addressing")
+		if self.AddrMode[0]=='Z' and indexreg!=None:  raise AsmException("Register addressing cannot be indexed")
+		# Immediate addressing
+		if self.AddrMode=='I' and numregcc==None:  raise AsmException("Missing register")
+		if self.AddrMode[0]=='I' and opval==None:  raise AsmException("Missing immediate value")
+		if self.AddrMode[0]=='I' and opval!=None and (opval<-127 or opval>255):	 raise AsmException("Immediate value must be a single byte (is d'%d', h'%04x')" % (opval,opval))
+		if self.AddrMode[0]=='I' and opval<0:  opval += 256
+		if self.AddrMode[0]=='I' and indirect:	raise AsmException("Indirect addressing not possible with Immediate addressing")
+		if self.AddrMode[0]=='I' and indexreg!=None:  raise AsmException("Immediate addressing cannot be indexed")
+		# Relative addressing
+		if self.AddrMode=='R' and numregcc==None:  raise AsmException("Missing condition code")
+		if self.AddrMode[0]=='R' and opval==None:  raise AsmException("Missing relative address");
+		if self.AddrMode=='R':
+			offset = opval-(self.PC+2)
+			if offset<-64 or offset>63:	 raise AsmException("Relative offset to '%s' is %d, and outside permitted range (-64..63)" % (txtoperand,offset))
+		if self.AddrMode=='R0':
+			offset = opval
+			if opval>0x1000:  offset = 0x2000 - opval
+			if offset<-64 or offset>63:	 raise AsmException("Page 0 offset to '%s' is %d, and outside permitted range (-64..63)" % (txtoperand,offset))
+		if self.AddrMode[0]=='R' and indexreg!=None:  raise AsmException("Relative addressing cannot be indexed")
+		#  mode 'A'
+		if self.AddrMode=='A' and numregcc==None:  raise AsmException("Missing register")
+		if self.AddrMode=='A' and indexreg!=None and numregcc!=0:  raise AsmException("Indexed addressing must operate on R0")
+		if self.AddrMode=='A' and (opval&0xc000 != self.PC&0xc000):	 raise AsmException("Cannot address across pages (consider using indirection)")
+		#  mode 'AB'
+		if self.AddrMode=='AB' and numregcc==None: raise AsmException("Missing condition code")
+		if self.AddrMode=='AB' and indexreg!=None:	raise AsmException("Indexing is not possible with absolute branch instructions")
+		#  mode 'A3'
+		if self.AddrMode=='A3' and indexreg==None:	raise AsmException("Instruction %s must be indexed" % opcode)
+		if self.AddrMode=='A3' and indexreg!=3:	 raise AsmException("Instruction %s must be indexed by register R3" % opcode)
+		if self.AddrMode=='A3' and autoinc!=3:	raise AsmException("Instruction %s cannot use increment/decrement" % opcode)
+		# mode 'AC'
+		if self.AddrMode=='AC' and indexreg!=None:	raise AsmException("Indexing is not possible with instruction %s" % opcode)
+		# Absolute addressing
+		if self.AddrMode[0]=='A' and opval==None:  raise AsmException("Missing absolute address");
+
+		# Warnings
+		if self.AddrMode[0]=='A' and indexreg!=None and (indexreg<1 or indexreg>3) and self.Pass==1 and instrwarnings:	self.warnline("R0 is both target register and index register")
+		if (self.AddrMode=='A' and autoinc==None) or self.AddrMode=='AB' or self.AddrMode=='A3':
+			# A valid operation using absolute addressing
+			warno = opval-(self.PC+2)
+			if -64<=warno<=63 and self.Pass==1 and relwarnings:
+				self.warnline("operation could have used relative addressing to '%s'" % (txtoperand))
+				if sedfile!=None: print("%ds/a,/r,/i" % lineno, file=sedfile)
+
+		if self.AddrMode=='A3':
+			indexreg = None			# BXA and BSXA always operate on R3. Opcode has no register field
+		if numregcc!=None:
+			self.OPCD += numregcc	# Modify the opcode. Note that this can always be done by addition.
+		self.targetregister = numregcc
+		if indexreg!=None:
+			self.OPCD += indexreg	# Safe, since numregcc *must* have been zero.
+		self.targetregister = indexreg
+
+		if self.AddrMode=='R':
+			opval = offset & 0x7f
+		if self.AddrMode[0]=='A':
+			if self.AddrMode=='AB' or self.AddrMode=='A3':
+				opval &= 0x7fff
+			else:
+				opval &= 0x1fff
+		if indexreg!=None:
+			opval |= autoinc<<13
+		if indirect:
+			if self.AddrMode[0]=='R': opval |= 0x80
+			if self.AddrMode[0]=='A': opval |= 0x8000
+		if opval!=None: self.OPND = (opval & 0xffff)
+
+		if self.OPCD==None:	 return
+		self.DataBytes = [self.OPCD]
+		if self.CmdLength==1:
+			pass
+		elif self.CmdLength==2: # 2 Byte Code
+			self.DataBytes.append(self.OPND&0xFF)
+		else:  # 3 Byte Code
+			self.DataBytes.append(self.OPND>>8)
+			self.DataBytes.append(self.OPND&0xFF)
+
+		return
+
+	# instruction *must* be a valid pseudo-op
+	# instruction must already be in upper case
+	def processpseudo(self, label, instruction, rest):
+		global SYMTAB, instrwarnings, segmPadded, args
+
+		if args.debug>=2: pBlue("label=«%s», pseudo=«%s», rest=«%s»" % (label,instruction,rest))
+		# Ignore END, EJE, PRT, SPC, TITL, PAG, PCH, START
+		if instruction in ('END', 'EJE', 'PRT', 'SPC', 'TITL', 'PAG', 'PCH', 'START'):
+			if label: self.processlabel(label)
+			return
+
+		# Process the operand part
+		try:
+			(opval,indirect,indexreg,autoinc) = self.evaluateExpression(rest)
+		except LabelNotFoundException as err:
+			# Handle only during first pass, re-raise on Pass==1
+			if self.Pass==1: raise
+			# Fake the results to evaluateExpression()
+			opval = 0
+			indirect = False
+			indexreg = None
+
+		if args.debug>=2 and self.Pass==1: pBlue("  >> opval=«%s», indirect=«%s», indexreg=«%s», autoinc=«%s», comment=«%s»" % (opval,indirect,indexreg,autoinc,self.Comment))
+		if indirect or indexreg:
+			raise AsmException("Invalid operand for pseudo-op " + instruction)
+
+		# DB/DATA and DW/ACON are the only pseudo-ops that takes a list of values
+		if instruction in ("DATA", "DB", "ACON", "DW"):
+			if label: self.processlabel(label)
+			if opval==None: opval = []
+			elif type(opval) is int: opval = [opval]
+			if instruction in ("DATA", "DB"):
+				for i in range(len(opval)):
+					if opval[i]<-127 or opval[i]>255 and self.Pass==1:
+						raise AsmException("DATA values must be a single byte (is %d)" % opval[i])
+					if opval[i]<0: opval[i] += 256
+			if instruction in ("ACON", "DW"):
+				vals = []
+				for i in range(len(opval)):
+					if opval[i]<0 and self.Pass==1:
+						raise AsmException("ACON values cannot be negative (is %d)" % opval[i])
+					if opval[i]>0xffff and self.Pass==1:
+						raise AsmException("ACON values must be a two bytes (is %x)" % opval[i])
+					vals.append(opval[i] >> 8)
+					vals.append(opval[i]  & 0xff)
+				opval = vals
+			self.DataBytes = opval
+			self.CmdLength = len(self.DataBytes)
+			return
+
+		if opval!=None and type(opval) is not int:
+			if len(opval)==1 and instruction=="EQU":
+				opval = opval[0]
+			else:
+				raise AsmException("Too many operands for instruction; list or string not permitted")
+				opval = 0
+
+		if instruction=="ORG":
+			if opval==None: raise AsmException("Missing address")
+			if segmPadded:
+				# Pad the current segment so that it reaches the start of the new segment.
+				totallen = 0
+				for i in range(len(self.codesectionslength)): totallen += self.codesectionslength[i]
+				if totallen>0:
+					if self.PC > opval: raise AsmException("ORG addresses must be in increasing order")
+					for i in range(opval-self.PC): self.DataBytes.append(0)
+			self.codesection += 1
+			self.codesectionslength.append(0)
+			self.PC = opval
+			self.nextPC = opval
+			self.Origin = opval
+			if label: self.processlabel(label)
+
+		if instruction=="EQU":
+			if opval==None: raise AsmException("Missing operand")
+			if label==None: raise AsmException("Missing label")
+			if opval<-128: raise AsmException("EQU value too small")
+			if opval>0xffff: raise AsmException("EQU value too large")
+			self.processlabel(label,opval)
+
+		if instruction=="RES":
+			if opval==None: raise AsmException("Missing operand")
+			if opval==0 and self.Pass==1 and instrwarnings:
+				self.warnline("Reserving zero bytes")
+			if opval<0: raise AsmException("RES value is negative")
+			self.CmdLength = opval
+			self.DataBytes = []
+			# When Single Segment:
+			# The RES command only outputs bytes to the binary file when there already is
+			# data in this codesection. It adds data after other bytes, but will not output
+			# bytes if it is the first instruction in its codesection.
+			# When Padded: always produce output
+			if segmPadded or self.codesectionslength[ len(self.codesectionslength)-1 ]>0:
+				for i in range(opval): self.DataBytes.append(0)
+			if label: self.processlabel(label)
+
+		if instruction=="DFLT":
+			# valid values for DFLT are: 0, 1, 10, 16
+			#  0 or 10 mean decimal numbers
+			#  1 or 16 mean hexadecimal numbers
+			if opval==None: raise AsmException("Missing operand")
+			if label!=None: raise AsmException("No label allowed for DFLT")
+			# Note that 0x10 evaluates to 16, and 0x16 evaluates to 22
+			if self.DFLT==16:
+				if opval==16: opval = 10
+				if opval==22: opval = 16
+			if opval==0: opval = 10
+			if opval==1: opval = 16
+			if opval==10 or opval==16:
+				self.DFLT = opval
+			else:
+				raise AsmException("Invalid numerical base '%s' for DFLT" % str(opval))
+
+	def processlabel(self, label, val=None):
+		"""
+		Add label at 'val' or at self.PC
+		"""
+		global SYMTAB, labelwarnings, CustomSymtab
+		ul = label.upper()
+		if args.debug>=2 and self.Pass==1: pBlue("Defining %s as %s" % (label,val))
+		if not (re.match('[A-Z_]',ul) and re.match(r'^[A-Z0-9_]+$',ul)):
+			raise AsmException("Invalid label '%s'" % label)
+		if val==None: val=self.PC
+		if ul in SYMTAB and SYMTAB[ul]!=val and self.Pass==0 and labelwarnings:
+			self.warnline("redefining symbol '%s' (previously defined as %04x)" % (label,SYMTAB[ul]))
+		SYMTAB[ul] = val
+		CustomSymtab[label] = val
+
+	def outputline(self,label,instruction,operand,comment):
+		"""
+		Format a line in the output listing.
+		It is safe to call this function when no outfile is specified and/or during the first pass.
+		"""
+
+		if self.Pass==0: return
+		if label==None: label=""
+		if instruction==None: instruction=""
+		if operand==None: operand=""
+		if comment==None: comment=""
+		Uinstr = instruction.upper()
+		if args.debug>=1: pBlue("OUT: label=«%s», instruction=«%s», operand=«%s», comment=«%s»" % (label,instruction,operand,comment))
+
+		# The format used
+		#         |1      |  2    |    3  |      4|       |5      |  6    |    7
+		# 12345678901234567890123456789012345678901234567890123456789012345678901234567890
+		# addr                    LABEL:          comment
+		# addr: 00 11 22 3                opcd,cc operand                 comment
+		# addr: 00 11 22 3        shrtlbl opcd,cc operand                 comment
+		# addr: 00 11 22 33 44 55                 DATA    A'This is a long data def'
+		# addr: 00 11 22 33 44 55 LongerLabel     DATA    A'This is a long data def'
+		#                         ; Full line comment
+
+		# Empty line
+		if label=="" and Uinstr=="" and comment=="":
+			self.Listing = ""
+			return
+		# Full-line comment
+		if label=="" and Uinstr=="" and comment!="":
+			self.Listing = "%24s%s" % ("",comment)
+			return
+
+		if len(comment)>0 and comment[0]!=';': comment = "; "+comment
+
+		# Full-line label
+		if label!="" and Uinstr=="":
+			self.Listing = "{0:04X}: {1:18s}{2:16s}{3}".format(self.PC,"",label+':',comment)
+			return
+
+		# Value of EQU symbol will be listed
+		if Uinstr=="EQU":
+			val = SYMTAB[label.upper()]
+			if val<0: val += 256
+			self.Listing  = "{0:02X}{1:02X}= {2:18s}{3:15s} {4}".format(val//256,val%256,"",label,instruction)
+			numsp = 20-len(label)
+			if numsp<1: numsp = 1
+			if numsp>5: numsp = 5
+			self.Listing += " "*numsp
+			self.Listing += "{0:15s} {1}".format(operand,comment)
+			return
+
+		# Label for code bytes will appear as a full line label if too long
+		if Uinstr not in Pseudo and len(label)>7 and len(self.DataBytes) > 0:
+			self.Listing += "{0:04X}: {1:18s}{2:s}:\n".format(self.PC,"",label)
+			label = ""
+		if Uinstr in Pseudo and len(label)>15:
+			self.Listing += "{0:04X}: {1:18s}{2:s}:\n".format(self.PC,"",label)
+			label = ""
+
+		if self.CmdLength > 0:
+			self.Listing += "{0:04X}: ".format(self.PC)
+		else:	# Padding for other non-coding Pseudo
+			self.Listing += "{0:8s}".format('')
+
+		# Padding for RES will be abbreviated if it is more than 6 bytes
+		if Uinstr=="RES" and len(self.DataBytes)>6:
+			self.Listing += "00 00 00 00 00... {0:16}{1:8}{2:8}{3}".format(label,instruction,operand,comment)
+			return
+
+		# Padding for ORG will not show in the listing, but is preserved because
+		# it must appear in the output file.
+		keepbytes = self.DataBytes
+		if Uinstr=="ORG": self.DataBytes=[]
+
+		if len(self.DataBytes)!=self.CmdLength: self.Listing += "  "
+
+		# There can be many DATA bytes to output. We only do 6 on the first line
+		# and print remaining data bytes on subsequent lines of 6 bytes max
+		n = 0
+		if 0<len(self.DataBytes)<=3:
+			for d in self.DataBytes:
+				self.Listing += "%02X " % d
+				n += 1
+			self.Listing += " "*3*(6-n)
+		elif len(self.DataBytes)>3:
+			while n<len(self.DataBytes) and n<6:
+				d = self.DataBytes[n]
+				self.Listing += "%02X " % d
+				n += 1
+			if n<6:
+				self.Listing += " "*3*(6-n)
+		else:	# Pseudo - no OPC
+			self.Listing += " "*16
+
+		if Uinstr in Pseudo:
+			self.Listing += "%-15s %-7s" % (label,instruction)
+			self.Listing += " %-15s" % operand
+		else:
+			self.Listing += "%-7s %-7s" % (label,instruction)
+			self.Listing += " %-23s" % operand
+		if len(comment)>0:
+			self.Listing += " %s" % comment
+
+		# print the remainder of the DATA bytes, if any
+		while n<len(self.DataBytes):
+			self.Listing += "\n"
+			self.Listing += "{0:04X}: ".format(self.PC+n)
+			d = self.DataBytes[n]
+			self.Listing += "%02X " % d
+			n += 1
+			while n<len(self.DataBytes) and n%6!=0:
+				d = self.DataBytes[n]
+				self.Listing += "%02X " % d
+				n += 1
+			# end the line, repeat from the outer while-loop
+
+		# restore DataBytes
+		self.DataBytes = keepbytes
+
+	# Process line of Assembler code
+	def parseline(self, line):
+		"""
+		Attempt to assemble a single line of input, and place the result into
+		self.Listing and self.DataBytes (if second pass)
+		May raise exceptions LabelNotFoundException or AsmException
+		"""
+		global allow2650b, args
+		if args.debug>=1: pBlue("IN:"+line)
+		self.initLine(line)
+
+		# Remove any trailing whitespace
+		line = re.sub(r'\s+$', '', line)
+
+		# EMPTY LINE - retain in output literally
+		if len(line)==0 :
+			self.outputline(None,None,None,self.line)
+			return
+
+		# FULL LINE COMMENT - retain in output (first non-whitespace char is * or ;)
+		firstchar = re.sub(r'^\s*', '', line)
+		if firstchar[0]=='*' or firstchar[0]==';':
+			self.outputline(None,None,None,self.line)
+			return
+
+		# FULL LINE LABEL
+		# if symbol ends with ":" with optionally a comment
+		m = re.match(r'^([a-zA-Z_][a-zA-Z_0-9]*):(\s+(.*))?',line)
+		if m:
+			self.processlabel(m.group(1))
+			self.outputline(m.group(1),None,None,m.group(3))
+			return
+
+		# Split line of Assembler code into component fields
+		#	Label	Instruction [operand]
+		#	The operand is optional, and may contain a Comment
+		try:
+			label, instruction, *rest = re.split('\\s+',line, maxsplit=2)
+		except Exception as e:
+			# Not enough values to unpack
+			raise AsmException("Missing instruction after label '%s'" % line)
+
+		if label=="": label=None
+		instr = instruction.upper().split(",")
+		rest = rest[0] if len(rest)>0 else ""
+
+		if len(instr)==0:
+			raise AsmException("Missing instruction")
+
+		if instr[0] in MNEC:
+			if label: self.processlabel(label)
+			if (instr[0]=='LDPL' or instr[0]=='STPL') and not allow2650b:
+				raise AsmException("Instruction %s is for 2650B only (consider using --allow2650b)" % instr[0])
+			else:
+				self.processinstruction(instr,rest) # result in OPCD and OPND
+		elif instruction.upper() in Pseudo:
+			self.processpseudo(label, instruction.upper(), rest)
+		else:
+			raise AsmException("Unknown instruction " + instr[0])
+
+		self.codesectionslength[ len(self.codesectionslength)-1 ] += len(self.DataBytes)
+
+		#pBlue("OUT: rest=«%s», comment=«%s»" % (rest,self.Comment))
+		# Remove the comment from rest to obtain the operand itself
+		operand = rest if self.Comment==None or len(self.Comment)==0 else rest[:-(len(self.Comment))]
+		operand = re.sub('\\s+$', '', operand)
+# 		if self.Comment!=None:  comment = self.Comment+comment
+		self.outputline(label,instruction,operand,self.Comment)
+
+# END class Assembler
+
+###############################################################
+# Utility functions
+def inthex(n):
+	"""
+	Convert a hexadecimal string to an integer value
+	"""
+	return int(n, 16)
+
+def intoct(n):
+	"""
+	Convert a octal string to an integer value
+	"""
+	return int(n, 8)
+
+def intbin(n):
+	"""
+	Convert a binary string to an integer value
+	"""
+	return int(n, 2)
+
+def convert_code_to_char(match_obj):
+	if match_obj.group() is not None:
+		return chr( int(match_obj.group(1), 16) )
+
+RED	  = "\033[1;31m"
+BLUE  = "\033[1;34m"
+RESET = "\033[0;0m"
+
+def pBlue(s):
+	print("%s%s%s" % (BLUE, s, RESET), file=sys.stderr)
+def pRed(s):
+	print("%s%s%s" % (RED, s, RESET), file=sys.stderr)
+
+def pwarn(w,line):
+	global warnings,filename,lineno, outfile
+	fn = os.path.basename(filename)
+	pBlue("%s:%d| Warning: %s." % (fn,lineno,w))
+	if args and args.ListOut and line:  printFileline(line)
+	if outfile!=None:
+		print("Warning: %s" % w, file=outfile)
+	warnings += 1
+def perr(e,line):
+	global errors,filename,lineno
+	fn = os.path.basename(filename)
+	pRed("%s:%d| Error: %s" % (fn,lineno,e))
+	errors += 1
+	if line:  printFileline(line)
+def pexception(err,ex):
+	print(err)
+	print("	 "+str(ex))
+	exit(1)
+def printFileline(str):
+	global filename,lineno
+	fn = os.path.basename(filename)
+	print("%s:%d| %s" % (fn,lineno,str))
+
+
+###############################################################
+# Main code
+
+# Global Variables
+lineno = 0		# used for warnings, set by PassOne/PassTwo
+filename = ""	# used for warnings, set by PassOne/PassTwo
+IncDirs = []	# include directories, when opening files
+errors = 0		# total number of errors encountered
+warnings = 0	# total number of warnings encountered
+relwarnings = True
+labelwarnings = True
+instrwarnings = True
+allwarnings = ("rel","label","instr","none")
+segoptions = ("single","padded")
+allow2650b = False
+segmPadded = False
+segmSingle = False
+defaultHex = False
+
+args = None			# command line argumenrs
+outfile = None		# where to send output listing
+sedfile = None		# where to send sed instructions
+a = Assembler()
+
+def entab(s, tabsize=8):
+	#return s
+	out = ""
+	i = 0			# index into string s
+	n = 0			# number of spaces encountered
+	for char in s:
+		i += 1
+		if char==" ":
+			n += 1
+			if i%tabsize==0:
+				out += "\t" if n>1 else " "
+				n = 0
+		elif char=="\n":
+			out += "\n"
+			n = 0
+			i = 0
+		else:
+			out += " " * n
+			out += char;
+			n = 0
+	return re.sub(r'\s+$','', out)
+
+
+def readFile(filename):
+	global IncDirs
+	found = False
+	incdirs = list(IncDirs)
+	incdirs.insert(0,'')
+	for pref in incdirs:
+		fn = os.path.join(pref,filename)
+		if os.path.isfile(fn):
+			found = True
+			break
+	if not found:
+		pexception("File '%s' not found or unreadable." % filename, '')
+
+	# 2650 Assembler files by necessity are small; just read whole file into memory
+	try:
+		infile = open(fn, 'r')
+		Code = infile.read()
+		infile.close()
+	except Exception as e:
+		pexception("File '%s' not found or unreadable: " % filename, e)
+	return Code.splitlines()
+
+# Process a file and all files referenced with INCLUDE
+def PassOne(fnam):
+	global filename,IncDirs,a,args
+	filename = fnam
+	IncDirs.insert(0, os.path.dirname(os.path.abspath(fnam)))
+	codelines = readFile(fnam)
+
+	currlineno = 0
+	global lineno
+	for line in codelines:
+		currlineno += 1
+		lineno = currlineno
+
+		# Remove STX, ETX and Ctrl-Z characters. These are used in the
+		# encoding of several old-style ASCII text files.
+		line = re.sub(r'\x02', '', line)
+		line = re.sub(r'\x03', '', line)
+		line = re.sub(r'\x1A', '', line)
+
+		if re.match(r'^INCLUDE\s',line):
+			line = re.sub(r'^INCLUDE\s+', '', line)
+			PassOne(line)
+			filename = fnam
+		elif re.match(r'^INCLUDE\*\s',line):
+			line = re.sub(r'^INCLUDE\*\s+', '', line)
+			PassOne(line)
+			filename = fnam
+		else:
+			try:
+				a.parseline(line)
+			except LabelNotFoundException as err:
+				# Ignore label errors during the first pass
+				pass
+			except AsmException as err:
+				# Ignore other errors during the first pass
+				pass
+			except Exception as e:
+				if args.debug>=1: raise	# re-raise the exception
+				perr("Syntax eror, leading to exception (%s)" % e, line)
+	IncDirs = IncDirs[1:]
+
+# Process a file and all files referenced with INCLUDE
+def PassTwo(fnam,codefile,showlisting=True):
+	global filename,IncDirs,outfile
+	filename = fnam
+	IncDirs.insert(0, os.path.dirname(os.path.abspath(fnam)))
+	codelines = readFile(fnam)
+
+	currlineno = 0
+	global lineno
+	for line in codelines:
+		currlineno += 1
+		lineno = currlineno
+
+		# Remove STX, ETX and Ctrl-Z characters. These are used in the
+		# encoding of several old-style ASCII text files.
+		line = re.sub(r'\x02', '', line)
+		line = re.sub(r'\x03', '', line)
+		line = re.sub(r'\x1A', '', line)
+
+		if re.match(r'^INCLUDE\s',line):
+			line = re.sub(r'^INCLUDE\s+', '', line)
+			if outfile!=None and errors==0 and showlisting:
+				print("%23s INCLUDE %s" % ("",line), file=outfile)
+			PassTwo(line,codefile,showlisting)
+			filename = fnam
+		elif re.match(r'^INCLUDE\*\s',line):
+			line = re.sub(r'^INCLUDE\*\s+', '', line)
+			if outfile!=None and errors==0 and showlisting:
+				print("%23s INCLUDE* %s" % ("",line), file=outfile)
+			PassTwo(line,codefile,showlisting=False)
+			filename = fnam
+		else:
+			try:
+				a.parseline(line)
+				if outfile!=None and showlisting:
+					print(entab(a.Listing), file=outfile)
+				# Stop producing output when an error has been detected
+				if len(a.DataBytes)>0 and codefile!=None and errors==0:
+					codefile.write(bytes(a.DataBytes))
+			except LabelNotFoundException as err:
+				perr(err, line)
+				if outfile!=None:
+					print(entab("ERROR: %s" % err), file=outfile)
+					line = re.sub(r'^\s+','        ', line)
+					print(entab("ERROR:%18s%s" % (" ",line)), file=outfile)
+			except AsmException as err:
+				perr(err, line)
+				if outfile!=None:
+					print(entab("ERROR: %s" % err), file=outfile)
+					line = re.sub(r'^\s+','        ', line)
+					print(entab("ERROR:%18s%s" % (" ",line)), file=outfile)
+			except Exception as e:
+				if args.debug>=1: raise	# re-raise the exception
+				perr("Syntax eror, leading to exception (%s)" % e, line)
+	IncDirs = IncDirs[1:]
+
+
+def main():
+	import argparse
+	global lineno, errors, relwarnings, labelwarnings, instrwarnings, allow2650b, VersionString, defaultHex
+	global outfile, sedfile, a, CustomSymtab
+	global segmSingle, segmPadded, IncDirs, args, warnings
+	codefile = None
+
+	# Parse command line for options
+	parser = argparse.ArgumentParser(description='Process 2650 Assembler Code -- version '+VersionString)
+	parser.add_argument(dest='infile',metavar='infile', help='input source code file')
+	parser.add_argument('-W', '--nowarn', action='append', default=[], dest='Warnings', choices=allwarnings, help='disable specified warning')
+	parser.add_argument('-B', '--allow2650b', action='store_true', help='enable instructions specific to 2650B-variant')
+	parser.add_argument('--segments', dest='Segments', choices=segoptions, help='how to handle multiple code segments (default=padded)')
+	parser.add_argument('-Ss', action='store_true', help='same as --segments single')
+	parser.add_argument('-Sp', action='store_true', default=True, help='same as --segments padded')
+	parser.add_argument('--include', '-I', dest='Dir', action='append', default=["$ASM2650INC"], help='directory for INCLUDE')
+	parser.add_argument('-l', dest='ListOut', action='store', help='output text listing file')
+	parser.add_argument('-o', dest='CodeOut', action='store', help='output binary code file')
+	parser.add_argument('-s', dest='SedOut', action='store', help='output sed instructions')
+	parser.add_argument('-H', '--hex', action='store_true', help='unprefixed numerical constants are hexadecimal')
+	parser.add_argument('--debug', '-d', action='count', default=False, help='enable debugging')
+	args = parser.parse_args()
+
+	# Check validity of -I arguments
+	IncDirs = []
+	for path in args.Dir:
+		path = os.path.expandvars(path)
+		for d in path.split(":"):
+			d = os.path.normpath(d)
+			d = os.path.expanduser(d)
+			d = os.path.expandvars(d)
+			if len(d)>0 and os.path.isdir(d): IncDirs.append(d)
+
+	# Warnings and options
+	relwarnings = ('rel' not in args.Warnings)
+	labelwarnings = ('label' not in args.Warnings)
+	instrwarnings = ('instr' not in args.Warnings)
+	if 'none' in args.Warnings:
+		relwarnings = False
+		labelwarnings = False
+		instrwarnings = False
+	allow2650b = args.allow2650b
+	defaultHex = args.hex
+	# Only one of single/padded will be true. Default is single; padded precedes single.
+	if args.Segments == 'single': args.Ss = True
+	if args.Segments == 'padded': args.Sp = True
+	if args.Sp: args.Ss = False
+	segmPadded = args.Sp
+	segmSingle = args.Ss
+
+	# Output options
+	if args.ListOut:
+		try:
+			if args.ListOut=="-": outfile = sys.stdout
+			else: outfile = open(args.ListOut, 'w')
+		except Exception as e:
+			pexception("Invalid listing file specified:", e)
+	if args.CodeOut:
+		try:
+			codefile = open(args.CodeOut , 'wb')
+		except Exception as e:
+			pexception("No (or invalid) binary file specified:", e)
+	# If no output options are specified, dump the listing to stdout
+	if outfile==None and codefile==None: outfile = sys.stdout
+
+	if args.SedOut:
+		try:
+			sedfile = open(args.SedOut , 'w')
+		except Exception as e:
+			pexception("No (or invalid) sed file specified:", e)
+
+	# Add predefined symbols for 2650B only
+	if args.allow2650b:
+		SYMTAB["UF1"] = 0x10
+		SYMTAB["UF2"] = 0x08
+
+	# do pass 1
+	a.initPass(0)	# First Pass - basic checks and error discovery
+	if args.debug>0: pRed("***FIRST PASS**")
+	PassOne(args.infile)
+
+	if a.Origin==None:
+		pwarn("No origin specified. Assuming origin 0; this is likely incorrect.",None)
+
+	if (errors>0):
+		try:
+			if args.ListOut and os.path.exists(args.ListOut): os.remove(args.ListOut)
+			if args.CodeOut and os.path.exists(args.CodeOut): os.remove(args.CodeOut)
+			if args.SedOut and os.path.exists(args.SedOut): os.remove(args.SedOut)
+		except Exception:
+			pass
+		pexception("%d errors and %d warnings encountered. Stopping." % (errors,warnings),"")
+		# no return from pexception
+
+	# do pass 2
+	a.initPass(1)	# Second Pass - print listing and binary outputs
+	if args.debug>0: pRed("***SECOND PASS**")
+	PassTwo(args.infile,codefile)
+
+	nzcs = 0	# number of codesections with non-zero length
+	for x in a.codesectionslength:
+		if x>0: nzcs += 1
+	if (nzcs>1 and args.Ss):
+		perr("Multiple output sections (using ORG pseudo-ops) not allowed; use --segments padded",None)
+		errors += 1
+
+	if outfile!=None:
+		print('\n; Symbol table', file=outfile)
+		print(';-------------', file=outfile)
+		for x in sorted(CustomSymtab, key=str.lower):
+			v = CustomSymtab[x]
+			if v<0: v += 256
+			print("%04X  %s" % (v,x), file=outfile)
+		print("\n%d errors and %d warnings encountered." % (errors,warnings), file=outfile)
+
+	if (errors>0):
+		try:
+			#if args.ListOut and os.path.exists(args.ListOut): os.remove(args.ListOut)
+			if args.CodeOut and os.path.exists(args.CodeOut): os.remove(args.CodeOut)
+			if args.SedOut and os.path.exists(args.SedOut): os.remove(args.SedOut)
+		except Exception:
+			pass
+		#pexception("%d errors and %d warnings encountered. Stopping." % (errors,warnings),"")
+
+	# Show errors, unless the listing was sent to the console
+	if errors+warnings>0 and outfile==None:
+		print("%d errors and %d warnings encountered." % (errors,warnings))
+
+	if codefile!=None: codefile.close()
+	if outfile!=None: outfile.close()
+	if sedfile!=None: sedfile.close()
+	# Remove the sed file if it is empty
+	if args.SedOut and os.path.exists(args.SedOut) and os.path.getsize(args.SedOut)==0: os.remove(args.SedOut)
+
+if __name__=='__main__':
+	main()
+	exit(errors)
