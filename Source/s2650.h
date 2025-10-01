@@ -42,6 +42,8 @@ public:
 	void LoadBinaryFile(char const* filename);
 	void LoadHexFile(char const* filename);
 	void Cycle();
+	void OutputRegisterInfoJSON();
+	void OutputRegisterInfoJSON(const char* filename);
 
 
 	addr_t IAR{};
@@ -87,6 +89,7 @@ public:
 	reg_t reg;
 	bool branch_taken{};
 	bool unconditional_branch_taken{};
+	bool halted{};
 
 	uint8_t registers[4]{};
 
@@ -248,7 +251,8 @@ private:
 	void ADD(reg_t reg, val_t val);
 	void SUB(reg_t reg, val_t val);
 	void AND(reg_t reg,val_t val);
-	void STR(reg_t reg,val_t val);
+	void STR2ADDR(addr_t addr,val_t val);
+	void STR2REG(reg_t reg,val_t val);
 	void IOR(reg_t reg,val_t val);
 	void EOR(reg_t reg,val_t val);
 	void COM(reg_t reg,val_t val);

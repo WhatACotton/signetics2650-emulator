@@ -342,15 +342,34 @@ void S2650::OP_NOP(){
 // STR Operations
 void S2650::OP_STRZ(){
 	val_t v = fetchFromRegisterZero();
-	STR(reg,v);
+	STR2REG(reg,v);
 	setCCBit(v);
 }
 void S2650::OP_STRR(){
-	STR(reg,relativeAddressing());
+	addr_t addr = IAR + 1 + (int8_t)offset;
+	if (index_mode)
+	{
+		addr = indirectAddressing(addr);
+	}
+	STR2ADDR(addr,fetchFromRegister());
 	IAR += 1;
 }
 void S2650::OP_STRA(){
-	STR(reg, absoluteAddressing());
+	addr_t addr = abs_addr;
+	if (index_mode){
+		addr = indirectAddressing(addr);
+	}
+	val_t idx = fetchFromRegister();
+	if(abs_ic == 0b00) {
+	} else if (abs_ic == 0b01) {
+		addr += ++idx & 0xFF;
+	} else if (abs_ic == 0b10) {
+		addr += --idx & 0xFF;
+	} else if (abs_ic == 0b11) {
+		addr += idx & 0xFF;
+	}
+	STR2REG(reg,idx);
+	STR2ADDR(addr,fetchFromRegister());
 	IAR += 2;
 }
 
@@ -391,7 +410,91 @@ void S2650::OP_SUBA(){
 
 void S2650::OP_HALT(){
 	std::cout << "HALT encountered at PC: " << std::hex << (IAR - 1) << std::endl;
-	std::exit(EXIT_SUCCESS);
+	halted = true;
+}
+
+void S2650::OutputRegisterInfoJSON(){
+	std::cout << "{\n";
+	std::cout << "  \"registers\": {\n";
+	std::cout << "    \"R0\": \"0x" << std::hex << (int)registers[0] << "\",\n";
+	std::cout << "    \"R1\": \"0x" << std::hex << (int)registers[1] << "\",\n";
+	std::cout << "    \"R2\": \"0x" << std::hex << (int)registers[2] << "\",\n";
+	std::cout << "    \"R3\": \"0x" << std::hex << (int)registers[3] << "\"\n";
+	std::cout << "  },\n";
+	std::cout << "  \"program_counter\": \"0x" << std::hex << IAR << "\",\n";
+	std::cout << "  \"status_registers\": {\n";
+	std::cout << "    \"PSU\": \"0x" << std::hex << (int)psu << "\",\n";
+	std::cout << "    \"PSL\": \"0x" << std::hex << (int)psl << "\"\n";
+	std::cout << "  },\n";
+	std::cout << "  \"psl_flags\": {\n";
+	std::cout << "    \"CC1\": " << (GET_PSL_BIT(this, PSL_CC1) ? "true" : "false") << ",\n";
+	std::cout << "    \"CC0\": " << (GET_PSL_BIT(this, PSL_CC0) ? "true" : "false") << ",\n";
+	std::cout << "    \"IDC\": " << (GET_PSL_BIT(this, PSL_IDC) ? "true" : "false") << ",\n";
+	std::cout << "    \"RS\": " << (GET_PSL_BIT(this, PSL_RS) ? "true" : "false") << ",\n";
+	std::cout << "    \"WC\": " << (GET_PSL_BIT(this, PSL_WC) ? "true" : "false") << ",\n";
+	std::cout << "    \"OVF\": " << (GET_PSL_BIT(this, PSL_OVF) ? "true" : "false") << ",\n";
+	std::cout << "    \"COM\": " << (GET_PSL_BIT(this, PSL_COM) ? "true" : "false") << ",\n";
+	std::cout << "    \"C\": " << (GET_PSL_BIT(this, PSL_C) ? "true" : "false") << "\n";
+	std::cout << "  },\n";
+	std::cout << "  \"stack\": [\n";
+	for (int i = 0; i < STACK_LEVELS; i++) {
+		std::cout << "    \"0x" << std::hex << RAS[i] << "\"";
+		if (i < STACK_LEVELS - 1) std::cout << ",";
+		std::cout << "\n";
+	}
+	std::cout << "  ],\n";
+	std::cout << "  \"last_opcode\": \"0x" << std::hex << opcode << "\",\n";
+	std::cout << "  \"operands\": {\n";
+	std::cout << "    \"operand0\": \"0x" << std::hex << (int)operand0 << "\",\n";
+	std::cout << "    \"operand1\": \"0x" << std::hex << (int)operand1 << "\"\n";
+	std::cout << "  }\n";
+	std::cout << "}\n";
+}
+
+void S2650::OutputRegisterInfoJSON(const char* filename){
+	std::ofstream file(filename);
+	if (!file.is_open()) {
+		std::cerr << "Error: Could not open file " << filename << " for writing\n";
+		return;
+	}
+	
+	file << "{\n";
+	file << "  \"registers\": {\n";
+	file << "    \"R0\": \"0x" << std::hex << (int)registers[0] << "\",\n";
+	file << "    \"R1\": \"0x" << std::hex << (int)registers[1] << "\",\n";
+	file << "    \"R2\": \"0x" << std::hex << (int)registers[2] << "\",\n";
+	file << "    \"R3\": \"0x" << std::hex << (int)registers[3] << "\"\n";
+	file << "  },\n";
+	file << "  \"program_counter\": \"0x" << std::hex << IAR << "\",\n";
+	file << "  \"status_registers\": {\n";
+	file << "    \"PSU\": \"0x" << std::hex << (int)psu << "\",\n";
+	file << "    \"PSL\": \"0x" << std::hex << (int)psl << "\"\n";
+	file << "  },\n";
+	file << "  \"psl_flags\": {\n";
+	file << "    \"CC1\": " << (GET_PSL_BIT(this, PSL_CC1) ? "true" : "false") << ",\n";
+	file << "    \"CC0\": " << (GET_PSL_BIT(this, PSL_CC0) ? "true" : "false") << ",\n";
+	file << "    \"IDC\": " << (GET_PSL_BIT(this, PSL_IDC) ? "true" : "false") << ",\n";
+	file << "    \"RS\": " << (GET_PSL_BIT(this, PSL_RS) ? "true" : "false") << ",\n";
+	file << "    \"WC\": " << (GET_PSL_BIT(this, PSL_WC) ? "true" : "false") << ",\n";
+	file << "    \"OVF\": " << (GET_PSL_BIT(this, PSL_OVF) ? "true" : "false") << ",\n";
+	file << "    \"COM\": " << (GET_PSL_BIT(this, PSL_COM) ? "true" : "false") << ",\n";
+	file << "    \"C\": " << (GET_PSL_BIT(this, PSL_C) ? "true" : "false") << "\n";
+	file << "  },\n";
+	file << "  \"stack\": [\n";
+	for (int i = 0; i < STACK_LEVELS; i++) {
+		file << "    \"0x" << std::hex << RAS[i] << "\"";
+		if (i < STACK_LEVELS - 1) file << ",";
+		file << "\n";
+	}
+	file << "  ],\n";
+	file << "  \"last_opcode\": \"0x" << std::hex << opcode << "\",\n";
+	file << "  \"operands\": {\n";
+	file << "    \"operand0\": \"0x" << std::hex << (int)operand0 << "\",\n";
+	file << "    \"operand1\": \"0x" << std::hex << (int)operand1 << "\"\n";
+	file << "  }\n";
+	file << "}\n";
+	
+	file.close();
 }
 
 // AND Operations
@@ -472,7 +575,7 @@ void S2650::OP_RRL(){
 	bool overflow = (x & 0x80) != 0;
 	// if 4th bit is 1, set IDC
 	bool idc = (x >> 3) & 0x1;
-	STR(reg, result);
+	STR2REG(reg, result);
 	setCCBit(result);
 	setCBit(msb);
 	setIDCBit(idc);
@@ -488,7 +591,7 @@ void S2650::OP_RRR(){
 	bool overflow = (x & 0x1) != 0;
 	// if 4th bit is 1, set IDC
 	bool idc = (x >> 3) & 0x1;
-	STR(reg, result);
+	STR2REG(reg, result);
 	setCCBit(result);
 	setCBit(lsb);
 	setIDCBit(idc);
@@ -508,22 +611,22 @@ void S2650::OP_LPSL(){
 void S2650::OP_SPSU(){
 	val_t v = fetchFromRegisterZero();
 	// 3,4 bit is always 0
-	STR(0, v & 0xE7);
+	STR2REG(0, v & 0xE7);
 	setCCBit(v & 0xE7);
 }
 void S2650::OP_SPSL(){
 	val_t v = fetchFromRegisterZero();
-	STR(0, psl);
+	STR2REG(0, psl);
 	setCCBit(v);
 }
 void S2650::OP_PPSU(){
 	IAR += 1;
 	// 3,4 bit is always 0
-	STR(0, (operand0 & 0xE7) | psu);
+	STR2REG(0, (operand0 & 0xE7) | psu);
 }
 void S2650::OP_PPSL(){
 	IAR += 1;
-	STR(0, operand0 | psl);
+	STR2REG(0, operand0 | psl);
 	setCCBit(operand0 | psl);
 }
 void S2650::OP_CPSU(){
@@ -609,7 +712,7 @@ void S2650::OP_BIRR(){
 	} else {
 		IAR += 2;
 	}
-	STR(reg,i);
+	STR2REG(reg,i);
 }
 
 void S2650::OP_BIRA(){
@@ -619,7 +722,7 @@ void S2650::OP_BIRA(){
 	} else {
 		IAR += 2;
 	}
-	STR(reg,i);
+	STR2REG(reg,i);
 }
 
 void S2650::OP_BDRR(){
@@ -629,7 +732,7 @@ void S2650::OP_BDRR(){
 	} else {
 		IAR += 1; // Should be 1, not 2, since global increment already happened
 	}
-	STR(reg,i);
+	STR2REG(reg,i);
 }
 
 void S2650::OP_BDRA(){
@@ -639,7 +742,7 @@ void S2650::OP_BDRA(){
 	} else {
 		IAR += 2;
 	}
-	STR(reg,i);
+	STR2REG(reg,i);
 }
 
 void S2650::OP_BRNR(){
@@ -718,7 +821,7 @@ void S2650::OP_BSNR(){
 	} else {
 		IAR += 2;
 	}
-	STR(reg,i);
+	STR2REG(reg,i);
 }
 void S2650::OP_BSNA(){
 	pushRAS();
@@ -728,7 +831,7 @@ void S2650::OP_BSNA(){
 	} else {
 		IAR += 2;
 	}
-	STR(reg,i);
+	STR2REG(reg,i);
 }
 void S2650::OP_BSXA(){
 	pushRAS();
@@ -761,7 +864,7 @@ void S2650::OP_REDD(){
 	DCIO = true;
 	ENEIO = false;
 	val_t v = readDBUS();
-	STR(reg, v);
+	STR2REG(reg, v);
 	setCCBit(v);
 }
 void S2650::OP_REDC(){
@@ -771,7 +874,7 @@ void S2650::OP_REDC(){
 	DCIO = false;
 	ENEIO = false;
 	val_t v = readDBUS();
-	STR(reg, v);
+	STR2REG(reg, v);
 	setCCBit(v);
 	IAR += 1;
 }
@@ -781,7 +884,7 @@ void S2650::OP_REDE(){
 	RWIO = false;
 	ENEIO = true;
 	val_t v = readDBUS();
-	STR(reg, v);
+	STR2REG(reg, v);
 	setCCBit(v);
 	IAR += 1;
 }
@@ -840,7 +943,7 @@ void S2650::OP_DAR(){
         v += 0x0A;
     }
 
-    STR(reg, v);
+    STR2REG(reg, v);
 }
 
 val_t S2650::readDBUS(){
@@ -882,7 +985,7 @@ void S2650::selectADR(val_t val){
 void S2650::AND(reg_t reg,val_t val){
 	uint8_t x = registers[reg];
 	uint8_t result = x & val;
-	STR(reg, result);
+	STR2REG(reg, result);
 	setCCBit(result);
 }
 
@@ -915,7 +1018,7 @@ void S2650::SUB(reg_t reg, val_t val){
 	setOVFBit(overflow);
 	
 	// Store result in register
-	STR(reg, result8);
+	STR2REG(reg, result8);
 	
 	// Condition code bit
 	setCCBit(result8);
@@ -923,7 +1026,7 @@ void S2650::SUB(reg_t reg, val_t val){
 void S2650::EOR(reg_t reg,val_t val){
 	uint8_t x = registers[reg];
 	uint8_t result = x ^ val;
-	STR(reg, result);
+	STR2REG(reg, result);
 	setCCBit(result);
 }
 
@@ -948,20 +1051,41 @@ void S2650::ADD(reg_t reg, val_t val){
 	bool sign_result = (result8 & 0x80) != 0;
 	bool overflow = (sign_a == sign_b) && (sign_a != sign_result);
 	setOVFBit(overflow);
-	
-	STR(reg, result8);
+
+	STR2REG(reg, result8);
 	setCCBit(result8);
 }
 
 
-void S2650::STR(reg_t reg,val_t val){
+void S2650::STR2ADDR(addr_t addr,val_t val){
+	switch (page_num)
+	{
+	case 0x00:
+		memory0[addr & 0x1FFF] = val;
+		break;
+	case 0x01:
+		memory1[addr & 0x1FFF] = val;
+		break;
+	case 0x02:
+		memory2[addr & 0x1FFF] = val;
+		break;
+	case 0x03:
+		memory3[addr & 0x1FFF] = val;
+		break;
+	default:
+		std::cerr << "Invalid page number: " << std::hex << page_num << " at address: " << std::hex << addr << std::endl;
+		std::exit(1);
+	}
+}
+void S2650::STR2REG(reg_t reg,val_t val){
 	registers[reg] = val;
+	setCCBit(val);
 }
 
 void S2650::IOR(reg_t reg,val_t val){
 	uint8_t x = registers[reg];
 	uint8_t result = x | val;
-	STR(reg, result);
+	STR2REG(reg, result);
 	setCCBit(result);
 }
 
@@ -1050,7 +1174,7 @@ val_t S2650::relativeAddressing(){
 	addr_t addr = IAR + 1 + (int8_t)offset;
 	val_t v;
 	if(index_mode) {
-		v = indirectAddressing(addr);
+		v = memoryAddressing(indirectAddressing(addr));
 	} else {
 		v = memoryAddressing(addr);
 	}
@@ -1071,7 +1195,7 @@ val_t S2650::absoluteAddressing(){
 	} else if (abs_ic == 0b11) {
 		addr += idx & 0xFF;
 	}
-	STR(reg, idx);
+	STR2REG(reg, idx);
 }
 val_t S2650::memoryAddressing(addr_t addr){
 	switch (page_num)
